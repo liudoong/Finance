@@ -9,6 +9,7 @@ Created on Tue Nov  7 17:17:54 2023
 import numpy as np
 import pandas as pd
 import pandas_datareader.data as web
+import matplotlib.pyplot as plt
 from scipy.optimize import minimize
 from datetime import datetime
 
@@ -64,3 +65,96 @@ else:
 
 # Now you can use calibrated_params to price other fixed income securities or to simulate future interest rate paths.
 
+
+#%%
+
+# Assume calibrated parameters theta, kappa, sigma
+theta = calibrated_params[0]  # calibrated theta
+kappa = calibrated_params[1]  # calibrated kappa
+sigma = calibrated_params[2]  # calibrated sigma
+
+# Take the last available yield for the 1-month Treasury bill as the current short rate R_0
+R_0 = treasury_yield_curve['DGS1MO'].iloc[-1] / 100  # Convert to decimal
+
+# Time step for simulation
+dt = 1/252  # One trading day ahead if we assume 252 trading days in a year
+
+
+# Define the function to calculate zero-coupon bond price using Hull-White model
+def zero_coupon_bond_price(r, kappa, theta, sigma, T):
+    B = (1 - np.exp(-kappa * T)) / kappa
+    A = np.exp((theta - (sigma**2) / (2 * kappa**2)) * (B - T) - (sigma**2) / (4 * kappa) * B**2)
+    return A * np.exp(-B * r)
+
+# Tenors for which we want to generate the yield curve
+tenors = np.array([0.0833, 0.25, 0.5, 1, 2, 3, 5, 7, 10, 20, 30])  # From 1 month to 30 years
+
+# Initialize the current short rate
+current_r = r0
+
+# DataFrame to store yield curves
+yield_curve_df = pd.DataFrame(index=tenors)
+
+# Simulate 5 steps ahead
+for step in range(5):
+    # Random shock for the Wiener process, assuming normal distribution
+    dw = np.random.normal(0, np.sqrt(dt))
+    
+    # Discretized Hull-White process for one time step
+    current_r = current_r + kappa * (theta - current_r) * dt + sigma * dw
+    
+    # Calculate zero-coupon bond prices for each tenor
+    zcb_prices = np.array([zero_coupon_bond_price(current_r, kappa, theta, sigma, T) for T in tenors])
+    
+    # Calculate the yield for each tenor
+    yields = -np.log(zcb_prices) / tenors
+    
+    # Add the yields to the DataFrame
+    yield_curve_df[f'Step {step+1}'] = yields
+
+# Plot the yield curves
+for column in yield_curve_df.columns:
+    plt.plot(yield_curve_df.index, yield_curve_df[column], label=column)
+
+plt.title('Simulated Yield Curves at 5 Steps Ahead')
+plt.xlabel('Tenor (years)')
+plt.ylabel('Yield')
+plt.legend()
+plt.grid(True)
+plt.show()
+
+#%%
+
+# Shortest tenor for which we want to generate the yield curve
+shortest_tenor = 0.0833  # Approximately 1 month
+
+# Initialize the current short rate
+current_r = r0
+
+# List to store the shortest tenor yields
+shortest_tenor_yields = []
+
+# Simulate 100 steps ahead
+for step in range(100):
+    # Random shock for the Wiener process, assuming normal distribution
+    dw = np.random.normal(0, np.sqrt(dt))
+    
+    # Discretized Hull-White process for one time step
+    current_r = current_r + kappa * (theta - current_r) * dt + sigma * dw
+    
+    # Calculate zero-coupon bond price for the shortest tenor
+    zcb_price = zero_coupon_bond_price(current_r, kappa, theta, sigma, shortest_tenor)
+    
+    # Calculate the yield for the shortest tenor
+    yield_ = -np.log(zcb_price) / shortest_tenor
+    
+    # Store the yield
+    shortest_tenor_yields.append(yield_)
+
+# Plot the distribution of the shortest tenor yields
+plt.hist(shortest_tenor_yields, bins=20, density=True)
+plt.title('Distribution of Forecasted Shortest Tenor Yields (100 Steps)')
+plt.xlabel('Yield')
+plt.ylabel('Probability Density')
+plt.grid(True)
+plt.show()
