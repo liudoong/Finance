@@ -90,7 +90,7 @@ def zero_coupon_bond_price(r, kappa, theta, sigma, T):
 tenors = np.array([0.0833, 0.25, 0.5, 1, 2, 3, 5, 7, 10, 20, 30])  # From 1 month to 30 years
 
 # Initialize the current short rate
-current_r = r0
+current_r = R_0
 
 # DataFrame to store yield curves
 yield_curve_df = pd.DataFrame(index=tenors)
@@ -129,7 +129,7 @@ plt.show()
 shortest_tenor = 0.0833  # Approximately 1 month
 
 # Initialize the current short rate
-current_r = r0
+current_r = R_0
 
 # List to store the shortest tenor yields
 shortest_tenor_yields = []
