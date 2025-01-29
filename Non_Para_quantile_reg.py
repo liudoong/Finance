@@ -24,8 +24,6 @@ def dataset(df, identifier, mpr):
     if identifier == 'ISIN':
         # Select relevant columns and drop rows with missing values
         df = df[['Date', 'ISIN', 'PRICE', 'MODDUR_M', 'ZSPRD_M']].dropna()
-        df['Date'] = pd.to_datetime(df['Date'], format = '%Y%m%d').dt.date
-        df.set_index(['Date','ISIN'], inplace = True)
         # Convert Date column to datetime format and extract the date part
         df['Date'] = pd.to_datetime(df['Date'], format='%Y%m%d').dt.date
         # Set Date and ISIN as the index
@@ -88,12 +86,8 @@ def epanechnikov_kernel(u):
 
 
 def local_polynomial_quantile_regression(data, grid, x_vars, y_var, quantile=0.99, bandwidth=1.0, degree=1):
-    grid_points = grid[x_vars].values
-    data_points = data[x_vars].values
-    y = data[y_var].values
     """
     Perform local polynomial quantile regression using multiple kernel functions.
-
 
     Parameters:
         data (pd.DataFrame): The input dataset containing the independent and dependent variables.
@@ -104,23 +98,18 @@ def local_polynomial_quantile_regression(data, grid, x_vars, y_var, quantile=0.9
         bandwidth (float): The bandwidth for the kernel functions (default is 1.0).
         degree (int): The degree of the polynomial (default is 1).
 
-
     Returns:
         pd.DataFrame: A DataFrame containing predicted results and neighborhood points used for each kernel.
     """
-
     # Extract grid points and data points as numpy arrays for faster computation
     grid_points = grid[x_vars].values  # Shape: (n_grid_points, n_x_vars)
     data_points = data[x_vars].values  # Shape: (n_data_points, n_x_vars)
     y = data[y_var].values             # Shape: (n_data_points,)
-
+    
     # Compute distances between all data points and grid points using broadcasting
     # Shape of distances: (n_data_points, n_grid_points)
     distances = np.linalg.norm(data_points[:, np.newaxis, :] - grid_points[np.newaxis, :, :], axis=2)
     
-        weights_tri = tri_cube_kernel(distances / bandwidth)
-        weights_gauss = gaussian_kernel(distances / bandwidth)
-        weights_epan = epanechnikov_kernel(distances / bandwidth)
     # Compute weights for each kernel function
     # Tri-cube kernel weights
     weights_tri = tri_cube_kernel(distances / bandwidth)  # Shape: (n_data_points, n_grid_points)
@@ -128,34 +117,28 @@ def local_polynomial_quantile_regression(data, grid, x_vars, y_var, quantile=0.9
     weights_gauss = gaussian_kernel(distances / bandwidth)  # Shape: (n_data_points, n_grid_points)
     # Epanechnikov kernel weights
     weights_epan = epanechnikov_kernel(distances / bandwidth)  # Shape: (n_data_points, n_grid_points)
-
-    num_neighborhood_tri = np.sum(weights_tri > 0, axis=0)
-    num_neighborhood_gauss = np.sum(weights_gauss > 0, axis=0)
-    num_neighborhood_epan = np.sum(weights_epan > 0, axis=0)
+    
     # Compute the number of neighborhood points for each kernel
     # Count the number of non-zero weights for each grid point
     num_neighborhood_tri = np.sum(weights_tri > 0, axis=0)  # Shape: (n_grid_points,)
     num_neighborhood_gauss = np.sum(weights_gauss > 0, axis=0)  # Shape: (n_grid_points,)
     num_neighborhood_epan = np.sum(weights_epan > 0, axis=0)  # Shape: (n_grid_points,)
-
+    
     # Construct the design matrix for data points
     # X_data is a matrix where each column is a polynomial term of the independent variables
     # Shape: (n_data_points, degree + 1)
     X_data = np.column_stack([data_points**d for d in range(degree + 1)])
-
+    
     # Construct the design matrix for grid points
     # X_grid is a matrix where each column is a polynomial term of the grid points
     # Shape: (n_grid_points, degree + 1)
     X_grid = np.column_stack([grid_points**d for d in range(degree + 1)])
     
-    predicted_tri = np.zeros(grid_points.shape[0])
-    predicted_gauss = np.zeros(grid_points.shape[0])
-    predicted_epan = np.zeros(grid_points.shape[0])
     # Initialize arrays to store predictions for each kernel
     predicted_tri = np.zeros(grid_points.shape[0])  # Shape: (n_grid_points,)
     predicted_gauss = np.zeros(grid_points.shape[0])  # Shape: (n_grid_points,)
     predicted_epan = np.zeros(grid_points.shape[0])  # Shape: (n_grid_points,)
-
+    
     # Fit models and make predictions for each grid point
     for i in range(grid_points.shape[0]):
         # Tri-cube kernel
@@ -168,9 +151,6 @@ def local_polynomial_quantile_regression(data, grid, x_vars, y_var, quantile=0.9
         result_gauss = model_gauss.fit(q=quantile, weights=weights_gauss[:, i])
         predicted_gauss[i] = result_gauss.predict(X_grid[i].reshape(1, -1))[0]
         
-        weights_tri = tri_cube_kernel(distances / bandwidth)
-        weights_gauss = gaussian_kernel(distances / bandwidth)
-        weights_epan = epanechnikov_kernel(distances / bandwidth)
         # Epanechnikov kernel
         model_epan = QuantReg(y, X_data)
         result_epan = model_epan.fit(q=quantile, weights=weights_epan[:, i])
@@ -184,42 +164,28 @@ def local_polynomial_quantile_regression(data, grid, x_vars, y_var, quantile=0.9
         'Gaussian_Neighborhood_Points': num_neighborhood_gauss,
         'Epanechnikov_Predicted': predicted_epan,
         'Epanechnikov_Neighborhood_Points': num_neighborhood_epan
-    num_neighborhood_tri = np.sum(weights_tri > 0, axis=0)
-    num_neighborhood_gauss = np.sum(weights_gauss > 0, axis=0)
-    num_neighborhood_epan = np.sum(weights_epan > 0, axis=0)
-
-    predicted_tri = np.zeros(grid_points.shape[0])
-    predicted_gauss = np.zeros(grid_points.shape[0])
-    predicted_epan = np.zeros(grid_points.shape[0])
     })
-
-    })
-    return output_df
-    return output_df
-    return output_df
-    return output_df
-    return output_df
-    return output_df
-    return output_df
-    return output_df
-    return output_df
+    
     return output_df
 
-
-
+# Example data
 data = pd.DataFrame({
-    'x1': np.random.rand(100),
-    'x2': np.random.rand(100),
-    'y': np.random.rand(100)
+    'x1': np.random.rand(100),  # Independent variable 1
+    'x2': np.random.rand(100),  # Independent variable 2
+    'y': np.random.rand(100)    # Dependent variable
 })
 
+# Grid points for prediction
 grid = pd.DataFrame({
-    'x1': np.linspace(0, 1, 10),
-    'x2': np.linspace(0, 1, 10)
+    'x1': np.linspace(0, 1, 10),  # Grid points for x1
+    'x2': np.linspace(0, 1, 10)   # Grid points for x2
 })
 
+# Run the function
 output_df = local_polynomial_quantile_regression(
     data, grid, x_vars=['x1', 'x2'], y_var='y', quantile=0.99, bandwidth=1.0, degree=1
 )
 
+# Display results
 print(output_df)
+
