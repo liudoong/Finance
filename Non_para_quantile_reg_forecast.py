@@ -169,6 +169,73 @@ def local_polynomial_quantile_regression(data, grid, x_vars, y_var, quantile=0.9
     
     return output_df, precomputed_info
 
+
+def predict_new_points(new_points, precomputed_info):
+    """
+    Predict values for new points using precomputed information from local polynomial quantile regression.
+
+    Parameters:
+        new_points (pd.DataFrame): New points to predict, with columns matching the original x_vars.
+        precomputed_info (dict): Precomputed information from the regression function.
+
+    Returns:
+        pd.DataFrame: A DataFrame containing predictions for the new points.
+    """
+    # Extract precomputed information
+    X_data = precomputed_info['X_data']
+    y = precomputed_info['y']
+    data_points = precomputed_info['data_points']
+    bandwidth = precomputed_info['bandwidth']
+    degree = precomputed_info['degree']
+    quantile = precomputed_info['quantile']
+    
+    # Extract new points as numpy array
+    new_points = new_points.values  # Shape: (n_new_points, n_x_vars)
+    
+    # Compute distances between new points and data points
+    distances = np.linalg.norm(data_points[:, np.newaxis, :] - new_points[np.newaxis, :, :], axis=2)  # Shape: (n_data_points, n_new_points)
+    
+    # Compute weights for each kernel
+    weights_tri = tri_cube_kernel(distances / bandwidth)  # Shape: (n_data_points, n_new_points)
+    weights_gauss = gaussian_kernel(distances / bandwidth)  # Shape: (n_data_points, n_new_points)
+    weights_epan = epanechnikov_kernel(distances / bandwidth)  # Shape: (n_data_points, n_new_points)
+    
+    # Construct design matrix for new points
+    X_new = np.column_stack([new_points**d for d in range(degree + 1)])  # Shape: (n_new_points, degree + 1)
+    
+    # Initialize arrays to store predictions
+    predicted_tri = np.zeros(new_points.shape[0])  # Shape: (n_new_points,)
+    predicted_gauss = np.zeros(new_points.shape[0])  # Shape: (n_new_points,)
+    predicted_epan = np.zeros(new_points.shape[0])  # Shape: (n_new_points,)
+    
+    # Fit models and make predictions for each new point
+    for i in range(new_points.shape[0]):
+        # Tri-cube kernel
+        model_tri = QuantReg(y, X_data)
+        result_tri = model_tri.fit(q=quantile, weights=weights_tri[:, i])
+        predicted_tri[i] = result_tri.predict(X_new[i].reshape(1, -1))[0]
+        
+        # Gaussian kernel
+        model_gauss = QuantReg(y, X_data)
+        result_gauss = model_gauss.fit(q=quantile, weights=weights_gauss[:, i])
+        predicted_gauss[i] = result_gauss.predict(X_new[i].reshape(1, -1))[0]
+        
+        # Epanechnikov kernel
+        model_epan = QuantReg(y, X_data)
+        result_epan = model_epan.fit(q=quantile, weights=weights_epan[:, i])
+        predicted_epan[i] = result_epan.predict(X_new[i].reshape(1, -1))[0]
+    
+    # Create output DataFrame
+    output_df = pd.DataFrame({
+        'TriCube_Predicted': predicted_tri,
+        'Gaussian_Predicted': predicted_gauss,
+        'Epanechnikov_Predicted': predicted_epan
+    })
+    
+    return output_df
+
+
+
 # Example data
 data = pd.DataFrame({
     'MODDUR_M': np.random.rand(100),  # Independent variable 1
