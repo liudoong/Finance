@@ -62,6 +62,14 @@ def local_polynomial_quantile_regression(data, grid, x_vars, y_var, quantile=0.9
     weights_gauss /= np.sum(weights_gauss, axis=0, keepdims=True)
     weights_epan /= np.sum(weights_epan, axis=0, keepdims=True)
     
+    # Function to fit quantile regression using sklearn's QuantileRegressor
+    def fit_quantile_regression(X, y, weights, quantile):
+        """ Ensure weights contain no NaN values before fitting the model """
+        weights = np.nan_to_num(weights, nan=0.0)  # Replace NaN with 0
+        model = QuantileRegressor(quantile=quantile, alpha=0, solver='highs')
+        model.fit(X, y, sample_weight=weights)
+        return model
+    
     # Construct polynomial features for regression
     X_data = np.column_stack([data_points**d for d in range(degree + 1)])
     X_grid = np.column_stack([grid_points**d for d in range(degree + 1)])
@@ -70,12 +78,6 @@ def local_polynomial_quantile_regression(data, grid, x_vars, y_var, quantile=0.9
     predicted_tri = np.zeros(grid_points.shape[0])
     predicted_gauss = np.zeros(grid_points.shape[0])
     predicted_epan = np.zeros(grid_points.shape[0])
-    
-    # Function to fit quantile regression using sklearn's QuantileRegressor
-    def fit_quantile_regression(X, y, weights, quantile):
-        model = QuantileRegressor(quantile=quantile, alpha=0, solver='highs')
-        model.fit(X, y, sample_weight=weights)
-        return model
     
     # Train and predict for each kernel function at each grid point
     for i in range(grid_points.shape[0]):
