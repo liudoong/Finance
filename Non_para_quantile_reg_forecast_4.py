@@ -83,16 +83,26 @@ def local_polynomial_quantile_regression(data, grid, x_vars, y_var, quantile=0.9
     predicted_epan = np.zeros(grid_points.shape[0])
     
     # Function to fit quantile regression
-    def fit_quantile_regression(X, y, weights, quantile):
-        """ Ensure weights contain no NaN values before fitting the model """
-        if weights is None or np.all(np.isnan(weights)):
-            weights = np.zeros_like(y)  # Default to uniform weights if invalid
-        else:
-            weights = replace_nan_with_mean(weights)  # Fix NaNs in weights
-        weights = np.nan_to_num(weights, nan=0.0)  # Ensure no NaN remains
-        model = QuantileRegressor(quantile=quantile, alpha=0, solver='highs')
-        model.fit(X, y, sample_weight=weights)
-        return model
+def fit_quantile_regression(X, y, weights, quantile):
+    """ Ensure weights contain no NaN values before fitting the model """
+    
+    # Check if weights are None or all NaN
+    if weights is None or np.all(np.isnan(weights)) or np.sum(weights) == 0:
+        weights = np.ones_like(y)  # Assign uniform weights if invalid
+    
+    # Ensure weights are 1D and contain no NaN
+    weights = np.nan_to_num(weights, nan=0.0)  
+    weights = np.reshape(weights, (-1,))  # Ensure correct shape
+    
+    # Debugging prints
+    print("Final weights (first 5 values):", weights[:5])
+    print("Shape of weights:", weights.shape)
+    print("Shape of X:", X.shape)
+    
+    # Fit the quantile regression model
+    model = QuantileRegressor(quantile=quantile, alpha=0, solver='highs')
+    model.fit(X, y, sample_weight=weights)
+    return model
     
     # Train and predict for each kernel function at each grid point
     for i in range(grid_points.shape[0]):
