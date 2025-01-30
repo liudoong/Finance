@@ -87,19 +87,6 @@ def epanechnikov_kernel(u):
 def local_polynomial_quantile_regression(data, grid, x_vars, y_var, quantile=0.99, bandwidth=1.0, degree=1):
     """
     Perform local polynomial quantile regression using multiple kernel functions.
-
-    Parameters:
-        data (pd.DataFrame): The input dataset containing the independent and dependent variables.
-        grid (pd.DataFrame): The grid points at which predictions are to be made.
-        x_vars (list): List of independent variable names.
-        y_var (str): Name of the dependent variable.
-        quantile (float): The quantile to fit (default is 0.99).
-        bandwidth (float): The bandwidth for the kernel functions (default is 1.0).
-        degree (int): The degree of the polynomial (default is 1).
-
-    Returns:
-        pd.DataFrame: A DataFrame containing predicted results and neighborhood points used for each kernel.
-        dict: A dictionary containing precomputed information for making predictions on new points.
     """
     # Extract grid points and data points as numpy arrays
     grid_points = grid[x_vars].values  # Shape: (n_grid_points, n_x_vars)
@@ -113,6 +100,16 @@ def local_polynomial_quantile_regression(data, grid, x_vars, y_var, quantile=0.9
     weights_tri = tri_cube_kernel(distances / bandwidth)  # Shape: (n_data_points, n_grid_points)
     weights_gauss = gaussian_kernel(distances / bandwidth)  # Shape: (n_data_points, n_grid_points)
     weights_epan = epanechnikov_kernel(distances / bandwidth)  # Shape: (n_data_points, n_grid_points)
+    
+    # Normalize weights
+    weights_tri = weights_tri / np.sum(weights_tri, axis=0)
+    weights_gauss = weights_gauss / np.sum(weights_gauss, axis=0)
+    weights_epan = weights_epan / np.sum(weights_epan, axis=0)
+    
+    # Debug: Print weights for the first grid point
+    print("Tri-cube weights for first grid point:", weights_tri[:, 0])
+    print("Gaussian weights for first grid point:", weights_gauss[:, 0])
+    print("Epanechnikov weights for first grid point:", weights_epan[:, 0])
     
     # Compute neighborhood points for each kernel
     num_neighborhood_tri = np.sum(weights_tri > 0, axis=0)  # Shape: (n_grid_points,)
@@ -157,18 +154,7 @@ def local_polynomial_quantile_regression(data, grid, x_vars, y_var, quantile=0.9
         'Epanechnikov_Neighborhood_Points': num_neighborhood_epan
     })
     
-    # Store precomputed information for predictions
-    precomputed_info = {
-        'X_data': X_data,  # Design matrix for data points
-        'y': y,            # Target variable
-        'data_points': data_points,  # Original data points
-        'bandwidth': bandwidth,
-        'degree': degree,
-        'quantile': quantile
-    }
-    
-    return output_df, precomputed_info
-
+    return output_df
 
 def predict_new_points(new_points, precomputed_info):
     """
