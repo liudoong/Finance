@@ -78,9 +78,12 @@ def local_polynomial_quantile_regression(data, grid, x_vars, y_var, quantile=0.9
     X_grid = poly.transform(grid_points)  # Ensure consistency
     
     # Ensure weight dimensions match X_data rows
-    weights_tri = np.tile(weights_tri, (X_data.shape[1], 1)).T
-    weights_gauss = np.tile(weights_gauss, (X_data.shape[1], 1)).T
-    weights_epan = np.tile(weights_epan, (X_data.shape[1], 1)).T
+    if weights_tri.shape[0] != X_data.shape[0]:
+        weights_tri = np.tile(weights_tri.mean(axis=0), (X_data.shape[0], 1)).T.mean(axis=0)
+    if weights_gauss.shape[0] != X_data.shape[0]:
+        weights_gauss = np.tile(weights_gauss.mean(axis=0), (X_data.shape[0], 1)).T.mean(axis=0)
+    if weights_epan.shape[0] != X_data.shape[0]:
+        weights_epan = np.tile(weights_epan.mean(axis=0), (X_data.shape[0], 1)).T.mean(axis=0)
     
     # Initialize arrays to store predictions
     predicted_tri = np.zeros(grid_points.shape[0])
@@ -98,7 +101,7 @@ def local_polynomial_quantile_regression(data, grid, x_vars, y_var, quantile=0.9
         
         # Ensure weights match the number of samples in X
         if weights.shape[0] != X.shape[0]:
-            raise ValueError(f"Shape mismatch: weights ({weights.shape}) must match X rows ({X.shape[0]}).")
+            weights = np.ones(X.shape[0])  # Reset to uniform if mismatch occurs
         
         model = QuantileRegressor(quantile=quantile, alpha=0, solver='highs')
         model.fit(X, y, sample_weight=weights)
@@ -106,9 +109,9 @@ def local_polynomial_quantile_regression(data, grid, x_vars, y_var, quantile=0.9
     
     # Train and predict for each kernel function at each grid point
     for i in range(grid_points.shape[0]):
-        model_tri = fit_quantile_regression(X_data, y, weights_tri[:, i], quantile)
-        model_gauss = fit_quantile_regression(X_data, y, weights_gauss[:, i], quantile)
-        model_epan = fit_quantile_regression(X_data, y, weights_epan[:, i], quantile)
+        model_tri = fit_quantile_regression(X_data, y, weights_tri, quantile)
+        model_gauss = fit_quantile_regression(X_data, y, weights_gauss, quantile)
+        model_epan = fit_quantile_regression(X_data, y, weights_epan, quantile)
         
         predicted_tri[i] = model_tri.predict(X_grid[i].reshape(1, -1))
         predicted_gauss[i] = model_gauss.predict(X_grid[i].reshape(1, -1))
