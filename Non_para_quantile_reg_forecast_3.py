@@ -52,6 +52,11 @@ def local_polynomial_quantile_regression(data, grid, x_vars, y_var, quantile=0.9
     weights_gauss = replace_nan_with_mean(weights_gauss)
     weights_epan = replace_nan_with_mean(weights_epan)
     
+    # Count neighborhood points used for each kernel
+    num_neighborhood_tri = np.sum(weights_tri > 0, axis=0)
+    num_neighborhood_gauss = np.sum(weights_gauss > 0, axis=0)
+    num_neighborhood_epan = np.sum(weights_epan > 0, axis=0)
+    
     # Normalize weights to ensure they sum to 1 across all data points for each grid point
     weights_tri /= np.sum(weights_tri, axis=0, keepdims=True)
     weights_gauss /= np.sum(weights_gauss, axis=0, keepdims=True)
@@ -82,11 +87,14 @@ def local_polynomial_quantile_regression(data, grid, x_vars, y_var, quantile=0.9
         predicted_gauss[i] = model_gauss.predict(X_grid[i].reshape(1, -1))
         predicted_epan[i] = model_epan.predict(X_grid[i].reshape(1, -1))
     
-    # Store predictions in a DataFrame
+    # Store predictions and neighborhood point counts in a DataFrame
     output_df = pd.DataFrame({
         'TriCube_Predicted': predicted_tri,
+        'TriCube_Neighborhood_Points': num_neighborhood_tri,
         'Gaussian_Predicted': predicted_gauss,
-        'Epanechnikov_Predicted': predicted_epan
+        'Gaussian_Neighborhood_Points': num_neighborhood_gauss,
+        'Epanechnikov_Predicted': predicted_epan,
+        'Epanechnikov_Neighborhood_Points': num_neighborhood_epan
     })
     
     # Store precomputed information for further predictions
