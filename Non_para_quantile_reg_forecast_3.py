@@ -24,9 +24,16 @@ def epanechnikov_kernel(u):
 # Function to replace NaN values in weights with the mean of non-NaN values
 def replace_nan_with_mean(weights):
     """ Replace NaN values with the mean of the non-NaN values in each column. """
-    nan_mask = np.isnan(weights)
-    col_mean = np.nanmean(weights, axis=0)  # Compute column-wise mean
-    weights[nan_mask] = np.take(col_mean, np.where(nan_mask)[1])  # Replace NaN values
+    if weights.ndim == 1:
+        nan_mask = np.isnan(weights)
+        mean_value = np.nanmean(weights)
+        weights[nan_mask] = mean_value if not np.isnan(mean_value) else 0
+    else:
+        nan_mask = np.isnan(weights)
+        col_mean = np.nanmean(weights, axis=0)
+        col_mean[np.isnan(col_mean)] = 0
+        for i in range(weights.shape[1]):
+            weights[nan_mask[:, i], i] = col_mean[i]
     return weights
 
 # Function for local polynomial quantile regression
@@ -65,7 +72,8 @@ def local_polynomial_quantile_regression(data, grid, x_vars, y_var, quantile=0.9
     # Function to fit quantile regression using sklearn's QuantileRegressor
     def fit_quantile_regression(X, y, weights, quantile):
         """ Ensure weights contain no NaN values before fitting the model """
-        weights = np.nan_to_num(weights, nan=0.0)  # Replace NaN with 0
+        weights = replace_nan_with_mean(weights)  # Fix NaNs in weights
+        weights = np.nan_to_num(weights, nan=0.0)  # Ensure no NaN remains
         model = QuantileRegressor(quantile=quantile, alpha=0, solver='highs')
         model.fit(X, y, sample_weight=weights)
         return model
@@ -110,6 +118,7 @@ def local_polynomial_quantile_regression(data, grid, x_vars, y_var, quantile=0.9
     }
     
     return output_df, precomputed_info
+
 
 
 # Function to predict new data points using precomputed model
