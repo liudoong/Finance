@@ -21,23 +21,18 @@ def epanechnikov_kernel(u):
     """ Epanechnikov kernel function used for weighting. """
     return np.where(np.abs(u) <= 1, 0.75 * (1 - u**2), 0)
 
+# Function to replace NaN values in weights with the mean of non-NaN values
+def replace_nan_with_mean(weights):
+    """ Replace NaN values with the mean of the non-NaN values in each column. """
+    nan_mask = np.isnan(weights)
+    col_mean = np.nanmean(weights, axis=0)  # Compute column-wise mean
+    weights[nan_mask] = np.take(col_mean, np.where(nan_mask)[1])  # Replace NaN values
+    return weights
+
 # Function for local polynomial quantile regression
 def local_polynomial_quantile_regression(data, grid, x_vars, y_var, quantile=0.99, bandwidth=1.0, degree=1):
     """ 
     Perform local polynomial quantile regression using different kernel functions.
-    
-    Parameters:
-        data (pd.DataFrame): The dataset containing independent and dependent variables.
-        grid (pd.DataFrame): Grid points where predictions will be made.
-        x_vars (list): List of independent variable names.
-        y_var (str): Name of the dependent variable.
-        quantile (float): The quantile to estimate (default 0.99 for upper quantile).
-        bandwidth (float): Bandwidth for kernel functions (default 1.0).
-        degree (int): Degree of the polynomial regression (default 1 for linear regression).
-    
-    Returns:
-        pd.DataFrame: DataFrame containing predictions for different kernel functions.
-        dict: Precomputed model information for future predictions.
     """
     # Extract data points and grid points
     grid_points = grid[x_vars].values
@@ -47,15 +42,20 @@ def local_polynomial_quantile_regression(data, grid, x_vars, y_var, quantile=0.9
     # Compute distances between data points and grid points
     distances = cdist(data_points, grid_points, metric='euclidean')
     
-    # Compute kernel weights for each distance matrix
+    # Compute kernel weights
     weights_tri = tri_cube_kernel(distances / bandwidth)
     weights_gauss = gaussian_kernel(distances / bandwidth)
     weights_epan = epanechnikov_kernel(distances / bandwidth)
     
+    # Replace NaN values in weights with the mean of non-NaN values
+    weights_tri = replace_nan_with_mean(weights_tri)
+    weights_gauss = replace_nan_with_mean(weights_gauss)
+    weights_epan = replace_nan_with_mean(weights_epan)
+    
     # Normalize weights to ensure they sum to 1 across all data points for each grid point
-    weights_tri /= weights_tri.sum(axis=0, keepdims=True)
-    weights_gauss /= weights_gauss.sum(axis=0, keepdims=True)
-    weights_epan /= weights_epan.sum(axis=0, keepdims=True)
+    weights_tri /= np.sum(weights_tri, axis=0, keepdims=True)
+    weights_gauss /= np.sum(weights_gauss, axis=0, keepdims=True)
+    weights_epan /= np.sum(weights_epan, axis=0, keepdims=True)
     
     # Construct polynomial features for regression
     X_data = np.column_stack([data_points**d for d in range(degree + 1)])
@@ -100,6 +100,7 @@ def local_polynomial_quantile_regression(data, grid, x_vars, y_var, quantile=0.9
     }
     
     return output_df, precomputed_info
+
 
 # Function to predict new data points using precomputed model
 def predict_new_points(new_points, precomputed_info):
