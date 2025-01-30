@@ -77,6 +77,11 @@ def local_polynomial_quantile_regression(data, grid, x_vars, y_var, quantile=0.9
     X_data = poly.fit_transform(data_points)
     X_grid = poly.transform(grid_points)  # Ensure consistency
     
+    # Ensure weight dimensions match X_data rows
+    weights_tri = np.tile(weights_tri, (X_data.shape[1], 1)).T
+    weights_gauss = np.tile(weights_gauss, (X_data.shape[1], 1)).T
+    weights_epan = np.tile(weights_epan, (X_data.shape[1], 1)).T
+    
     # Initialize arrays to store predictions
     predicted_tri = np.zeros(grid_points.shape[0])
     predicted_gauss = np.zeros(grid_points.shape[0])
@@ -84,24 +89,17 @@ def local_polynomial_quantile_regression(data, grid, x_vars, y_var, quantile=0.9
     
     # Function to fit quantile regression
     def fit_quantile_regression(X, y, weights, quantile):
-        """ Ensure weights contain no NaN values and match X.shape before fitting the model """
-        
-        # Ensure weights are valid
+        """ Ensure weights contain no NaN values before fitting the model """
         if weights is None or np.all(np.isnan(weights)) or np.sum(weights) == 0:
-            weights = np.ones_like(y)  # Assign uniform weights if invalid
-        
-        # Flatten weights to ensure it's a 1D array matching X rows
-        weights = np.nan_to_num(weights, nan=0.0).flatten()  
-
-        # Debugging: Print shapes
-        print("Final weights shape:", weights.shape)
-        print("X shape:", X.shape)
+            weights = np.ones(X.shape[0])  # Assign uniform weights if invalid
+        else:
+            weights = replace_nan_with_mean(weights)  # Fix NaNs in weights
+        weights = np.nan_to_num(weights, nan=0.0).flatten()  # Ensure no NaN remains and flatten
         
         # Ensure weights match the number of samples in X
         if weights.shape[0] != X.shape[0]:
             raise ValueError(f"Shape mismatch: weights ({weights.shape}) must match X rows ({X.shape[0]}).")
         
-        # Fit the quantile regression model
         model = QuantileRegressor(quantile=quantile, alpha=0, solver='highs')
         model.fit(X, y, sample_weight=weights)
         return model
