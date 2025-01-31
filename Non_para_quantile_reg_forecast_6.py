@@ -130,9 +130,12 @@ def epanechnikov_kernel(u):
     return np.where(np.abs(u) <= 1, 0.75 * (1 - u**2), 0)
 
 
-def local_polynomial_quantile_regression_for_grid(df, grid_data, kernel_func, bandwidth=1, degree=1, quantile=0.01):
+def local_polynomial_quantile_regression_for_grid(
+    df, grid_data, kernel_func, bandwidth=1, degree=1, quantile=0.5, num_neighbors=None
+):
     """
     Perform local polynomial quantile regression on a large dataset but only calculate forecasts for grid points.
+    Optionally, limit the number of nearest neighborhood points used in the regression.
 
     Parameters:
     df (pd.DataFrame): The large dataset with columns ['MODDUR_M', 'ZSPRD_M', 'RT'].
@@ -141,6 +144,7 @@ def local_polynomial_quantile_regression_for_grid(df, grid_data, kernel_func, ba
     bandwidth (float): The bandwidth for the kernel function.
     degree (int): The degree of the polynomial.
     quantile (float): The quantile to regress (default is 0.5 for median regression).
+    num_neighbors (int): The number of nearest neighborhood points to use (optional). If None, use all points.
 
     Returns:
     pd.DataFrame: A DataFrame with the grid points and their forecasted RT values.
@@ -171,25 +175,37 @@ def local_polynomial_quantile_regression_for_grid(df, grid_data, kernel_func, ba
     for i in range(len(X_grid)):
         # Calculate the distance between the grid point and all points in the large dataset
         distances = np.linalg.norm(X - X_grid[i], axis=1)
-        
+
+        # If num_neighbors is specified, select only the nearest k points
+        if num_neighbors is not None:
+            # Get the indices of the nearest k points
+            nearest_indices = np.argsort(distances)[:num_neighbors]
+            distances = distances[nearest_indices]
+            X_nearest = X[nearest_indices]
+            y_nearest = y[nearest_indices]
+        else:
+            # Use all points
+            X_nearest = X
+            y_nearest = y
+
         # Calculate the weights using the kernel function
         weights = kernel(distances / bandwidth)
-        
-        # Create polynomial features for the large dataset
-        X_poly = np.column_stack([X[:, 0]**d for d in range(degree + 1)] +
-                                 [X[:, 1]**d for d in range(degree + 1)])
-        
+
+        # Create polynomial features for the nearest points
+        X_poly = np.column_stack([X_nearest[:, 0]**d for d in range(degree + 1)] +
+                                 [X_nearest[:, 1]**d for d in range(degree + 1)])
+
         # Fit the quantile regression model
         model = QuantileRegressor(quantile=quantile, alpha=0.0)
-        model.fit(X_poly, y, sample_weight=weights)
-        
+        model.fit(X_poly, y_nearest, sample_weight=weights)
+
         # Create polynomial features for the grid point
         X_poly_grid = np.column_stack([X_grid[i, 0]**d for d in range(degree + 1)] +
                                       [X_grid[i, 1]**d for d in range(degree + 1)])
-        
+
         # Forecast the RT for the grid point
         forecasted_rt_grid[i] = model.predict(X_poly_grid)
-        
+
         # Store the regression results for future use
         regression_results.append({
             'coefficients': model.coef_,
