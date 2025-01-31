@@ -81,7 +81,7 @@ def local_polynomial_quantile_regression_for_grid(
     df, grid_data, kernel_func, bandwidth=1, degree=1, quantile=0.5, num_neighbors=None
 ):
     """
-    Perform local polynomial quantile regression using statsmodels.QuantReg.
+    Perform local polynomial quantile regression using statsmodels.QuantReg with weights.
     """
     if kernel_func == 'tri_cube':
         kernel = tri_cube_kernel
@@ -114,9 +114,14 @@ def local_polynomial_quantile_regression_for_grid(
         X_poly = np.column_stack([X_nearest[:, 0]**d for d in range(degree + 1)] +
                                  [X_nearest[:, 1]**d for d in range(degree + 1)])
 
+        # Apply weights to the data
+        sqrt_weights = np.sqrt(weights)
+        y_weighted = y_nearest * sqrt_weights
+        X_weighted = X_poly * sqrt_weights[:, np.newaxis]
+
         # Fit the quantile regression model using statsmodels.QuantReg
-        model = QuantReg(y_nearest, X_poly)
-        results = model.fit(q=quantile, weights=weights)
+        model = QuantReg(y_weighted, X_weighted)
+        results = model.fit(q=quantile)
         
         X_poly_grid = np.column_stack([X_grid[i, 0]**d for d in range(degree + 1)] +
                                       [X_grid[i, 1]**d for d in range(degree + 1)])
