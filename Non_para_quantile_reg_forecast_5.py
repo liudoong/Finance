@@ -44,6 +44,35 @@ columns = ['Date', 'ISIN', 'CUSIP', 'PRICE', 'MODDUR_M', 'ZSPRD_M']
 df = pd.DataFrame(data, columns=columns)
 
 
+def generate_grid_data(moddur_range, zsprd_range, num_points):
+    """
+    Generate a grid of MODDUR_M and ZSPRD_M values for quantile regression.
+
+    Parameters:
+    moddur_range (tuple): A tuple (min, max) specifying the range of MODDUR_M values.
+    zsprd_range (tuple): A tuple (min, max) specifying the range of ZSPRD_M values.
+    num_points (int): The number of points to generate in each dimension.
+
+    Returns:
+    pd.DataFrame: A DataFrame containing the grid of MODDUR_M and ZSPRD_M values.
+    """
+    # Generate evenly spaced values for MODDUR_M and ZSPRD_M
+    moddur_values = np.linspace(moddur_range[0], moddur_range[1], num_points)
+    zsprd_values = np.linspace(zsprd_range[0], zsprd_range[1], num_points)
+
+    # Create a grid of MODDUR_M and ZSPRD_M values
+    moddur_grid, zsprd_grid = np.meshgrid(moddur_values, zsprd_values)
+    moddur_grid = moddur_grid.flatten()
+    zsprd_grid = zsprd_grid.flatten()
+
+    # Create a DataFrame from the grid
+    grid_data = pd.DataFrame({
+        'MODDUR_M': moddur_grid,
+        'ZSPRD_M': zsprd_grid
+    })
+
+    return grid_data
+
 def dataset(df, identifier, mpr):
     """
     Preprocess the dataset based on the identifier (ISIN or CUSIP) and calculate the return (RT).
