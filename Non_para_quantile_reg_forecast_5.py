@@ -73,6 +73,16 @@ def generate_grid_data(moddur_range, zsprd_range, num_points):
 
     return grid_data
 
+
+# Define the range and number of points for MODDUR_M and ZSPRD_M
+moddur_range = (1, 10)
+zsprd_range = (0.5, 2.5)
+num_points = 10
+
+# Generate the grid data
+grid_data = generate_grid_data(moddur_range, zsprd_range, num_points)
+
+
 def dataset(df, identifier, mpr):
     """
     Preprocess the dataset based on the identifier (ISIN or CUSIP) and calculate the return (RT).
