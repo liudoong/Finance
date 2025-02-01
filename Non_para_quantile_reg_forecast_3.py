@@ -1,14 +1,70 @@
 import os
 import numpy as np
 import pandas as pd
-#import matplotlib.pyplot as plt
-#import seaborn as sns
-from datetime import datetime
-from mpl_toolkits.mplot3d import Axes3D
-from scipy.spatial.distance import cdist
-from sklearn.linear_model import QuantileRegressor
+from datetime import datetime, timedelta
+from statsmodels.regression.quantile_regression import QuantReg
 
-# Define kernel functions used for weighting nearby points
+def generate_sample_data():
+    # Generate sample data
+    np.random.seed(42)  # For reproducibility
+    # Generate dates
+    start_date = datetime(2000, 1, 1)
+    end_date = datetime(2023, 12, 31)
+    dates = [start_date + timedelta(days=i) for i in range((end_date - start_date).days + 1)]
+    # Generate ISINs and CUSIPs
+    isins = ['ISIN001', 'ISIN002', 'ISIN003']
+    cusips = ['CUSIP001', 'CUSIP002', 'CUSIP003']
+    # Generate random prices, modified duration, and Z-spread
+    data = []
+    for date in dates:
+        for isin in isins:
+            price = np.random.uniform(90, 110)
+            moddur_m = np.random.uniform(1, 10)
+            zsprd_m = np.random.uniform(1, 1500)
+            data.append([date.strftime('%Y%m%d'), isin, None, price, moddur_m, zsprd_m])
+        for cusip in cusips:
+            price = np.random.uniform(90, 110)
+            moddur_m = np.random.uniform(1, 10)
+            zsprd_m = np.random.uniform(1, 1500)
+            data.append([date.strftime('%Y%m%d'), None, cusip, price, moddur_m, zsprd_m])
+    # Create DataFrame
+    columns = ['Date', 'ISIN', 'CUSIP', 'PRICE', 'MODDUR_M', 'ZSPRD_M']
+    df = pd.DataFrame(data, columns=columns)
+    return df
+
+def generate_grid_data(moddur_range, zsprd_range, num_points):
+    """
+    Generate a grid of MODDUR_M and ZSPRD_M values for quantile regression.
+    """
+    moddur_values = np.linspace(moddur_range[0], moddur_range[1], num_points)
+    zsprd_values = np.linspace(zsprd_range[0], zsprd_range[1], num_points)
+    moddur_grid, zsprd_grid = np.meshgrid(moddur_values, zsprd_values)
+    moddur_grid = moddur_grid.flatten()
+    zsprd_grid = zsprd_grid.flatten()
+    grid_data = pd.DataFrame({
+        'MODDUR_M': moddur_grid,
+        'ZSPRD_M': zsprd_grid
+    })
+    return grid_data
+
+def dataset(df, identifier, mpr):
+    """
+    Preprocess the dataset based on the identifier (ISIN or CUSIP) and calculate the return (RT).
+    """
+    if identifier == 'ISIN':
+        df = df[['Date', 'ISIN', 'PRICE', 'MODDUR_M', 'ZSPRD_M']].dropna()
+        df['Date'] = pd.to_datetime(df['Date'], format='%Y%m%d').dt.date
+        df.set_index(['Date', 'ISIN'], inplace=True)
+        df['RT'] = df.groupby('ISIN')['PRICE'].pct_change(mpr)
+        df = df.dropna()
+    elif identifier == 'CUSIP':
+        df = df[['Date', 'CUSIP', 'PRICE', 'MODDUR_M', 'ZSPRD_M']].dropna()
+        df['Date'] = pd.to_datetime(df['Date'], format='%Y%m%d').dt.date
+        df.set_index(['Date', 'CUSIP'], inplace=True)
+        df['RT'] = df.groupby('CUSIP')['PRICE'].pct_change(mpr)
+        df = df.dropna()
+    return df
+
 def tri_cube_kernel(u):
     """ Tri-cube kernel function used for weighting. """
     return np.where(np.abs(u) <= 1, (1 - np.abs(u)**3)**3, 0)
@@ -17,161 +73,116 @@ def gaussian_kernel(u):
     """ Gaussian kernel function used for weighting. """
     return np.exp(-0.5 * u**2)
 
-def epanechnikov_kernel(u):
-    """ Epanechnikov kernel function used for weighting. """
-    return np.where(np.abs(u) <= 1, 0.75 * (1 - u**2), 0)
+def uniform_kernel(u):
+    """ Uniform kernel function used for weighting. """
+    return np.where(np.abs(u) <= 1, 1, 0)
 
-# Function to replace NaN values in weights with the mean of non-NaN values
-def replace_nan_with_mean(weights):
-    """ Replace NaN values with the mean of the non-NaN values in each column. """
-    if weights.ndim == 1:
-        nan_mask = np.isnan(weights)
-        mean_value = np.nanmean(weights)
-        weights[nan_mask] = mean_value if not np.isnan(mean_value) else 0
+def local_polynomial_quantile_regression_for_grid(
+    df, grid_data, kernel_func, bandwidth=1, degree=1, quantile=0.01, num_neighbors=None):
+    """
+    Perform local polynomial quantile regression using statsmodels.QuantReg with weights.
+    """
+    if kernel_func == 'tri_cube':
+        kernel = tri_cube_kernel
+    elif kernel_func == 'gaussian':
+        kernel = gaussian_kernel
+    elif kernel_func == 'uniform':
+        kernel = uniform_kernel
     else:
-        nan_mask = np.isnan(weights)
-        col_mean = np.nanmean(weights, axis=0)
-        col_mean[np.isnan(col_mean)] = 0
-        for i in range(weights.shape[1]):
-            weights[nan_mask[:, i], i] = col_mean[i]
-    return weights
+        raise ValueError("Invalid kernel function. Choose from 'tri_cube', 'gaussian', or 'uniform'.")
 
-# Function for local polynomial quantile regression
-def local_polynomial_quantile_regression(data, grid, x_vars, y_var, quantile=0.99, bandwidth=1.0, degree=1):
-    """ 
-    Perform local polynomial quantile regression using different kernel functions.
-    """
-    # Extract data points and grid points
-    grid_points = grid[x_vars].values
-    data_points = data[x_vars].values
-    y = data[y_var].values
-    
-    # Compute distances between data points and grid points
-    distances = cdist(data_points, grid_points, metric='euclidean')
-    
-    # Compute kernel weights
-    weights_tri = tri_cube_kernel(distances / bandwidth)
-    weights_gauss = gaussian_kernel(distances / bandwidth)
-    weights_epan = epanechnikov_kernel(distances / bandwidth)
-    
-    # Replace NaN values in weights with the mean of non-NaN values
-    weights_tri = replace_nan_with_mean(weights_tri)
-    weights_gauss = replace_nan_with_mean(weights_gauss)
-    weights_epan = replace_nan_with_mean(weights_epan)
-    
-    # Count neighborhood points used for each kernel
-    num_neighborhood_tri = np.sum(weights_tri > 0, axis=0)
-    num_neighborhood_gauss = np.sum(weights_gauss > 0, axis=0)
-    num_neighborhood_epan = np.sum(weights_epan > 0, axis=0)
-    
-    # Normalize weights to ensure they sum to 1 across all data points for each grid point
-    weights_tri /= np.sum(weights_tri, axis=0, keepdims=True)
-    weights_gauss /= np.sum(weights_gauss, axis=0, keepdims=True)
-    weights_epan /= np.sum(weights_epan, axis=0, keepdims=True)
-    
-    # Function to fit quantile regression using sklearn's QuantileRegressor
-    def fit_quantile_regression(X, y, weights, quantile):
-        """ Ensure weights contain no NaN values before fitting the model """
-        weights = replace_nan_with_mean(weights)  # Fix NaNs in weights
-        weights = np.nan_to_num(weights, nan=0.0)  # Ensure no NaN remains
-        model = QuantileRegressor(quantile=quantile, alpha=0, solver='highs')
-        model.fit(X, y, sample_weight=weights)
-        return model
-    
-    # Construct polynomial features for regression
-    X_data = np.column_stack([data_points**d for d in range(degree + 1)])
-    X_grid = np.column_stack([grid_points**d for d in range(degree + 1)])
-    
-    # Initialize arrays to store predictions
-    predicted_tri = np.zeros(grid_points.shape[0])
-    predicted_gauss = np.zeros(grid_points.shape[0])
-    predicted_epan = np.zeros(grid_points.shape[0])
-    
-    # Train and predict for each kernel function at each grid point
-    for i in range(grid_points.shape[0]):
-        model_tri = fit_quantile_regression(X_data, y, weights_tri[:, i], quantile)
-        model_gauss = fit_quantile_regression(X_data, y, weights_gauss[:, i], quantile)
-        model_epan = fit_quantile_regression(X_data, y, weights_epan[:, i], quantile)
+    X = df[['MODDUR_M', 'ZSPRD_M']].values
+    y = df['RT'].values
+    X_grid = grid_data[['MODDUR_M', 'ZSPRD_M']].values
+
+    forecasted_rt_grid = np.zeros(len(grid_data))
+    regression_results = []
+
+    for i in range(len(X_grid)):
+        distances = np.linalg.norm(X - X_grid[i], axis=1)
+        if num_neighbors is not None:
+            nearest_indices = np.argsort(distances)[:num_neighbors]
+            distances = distances[nearest_indices]
+            X_nearest = X[nearest_indices]
+            y_nearest = y[nearest_indices]
+        else:
+            X_nearest = X
+            y_nearest = y
+
+        weights = kernel(distances / bandwidth)
+        X_poly = np.column_stack([X_nearest[:, 0]**d for d in range(degree + 1)] +
+                                 [X_nearest[:, 1]**d for d in range(degree + 1)])
+
+        # Apply weights to the data
+        sqrt_weights = np.sqrt(weights)
+        y_weighted = y_nearest * sqrt_weights
+        X_weighted = X_poly * sqrt_weights[:, np.newaxis]
+
+        # Fit the quantile regression model using statsmodels.QuantReg
+        model = QuantReg(y_weighted, X_weighted)
+        results = model.fit(q=quantile)
         
-        predicted_tri[i] = model_tri.predict(X_grid[i].reshape(1, -1))
-        predicted_gauss[i] = model_gauss.predict(X_grid[i].reshape(1, -1))
-        predicted_epan[i] = model_epan.predict(X_grid[i].reshape(1, -1))
-    
-    # Store predictions and neighborhood point counts in a DataFrame
-    output_df = pd.DataFrame({
-        'TriCube_Predicted': predicted_tri,
-        'TriCube_Neighborhood_Points': num_neighborhood_tri,
-        'Gaussian_Predicted': predicted_gauss,
-        'Gaussian_Neighborhood_Points': num_neighborhood_gauss,
-        'Epanechnikov_Predicted': predicted_epan,
-        'Epanechnikov_Neighborhood_Points': num_neighborhood_epan
-    })
-    
-    # Store precomputed information for further predictions
-    precomputed_info = {
-        'X_data': X_data,
-        'y': y,
-        'data_points': data_points,
-        'bandwidth': bandwidth,
-        'degree': degree,
-        'quantile': quantile
-    }
-    
-    return output_df, precomputed_info
+        X_poly_grid = np.column_stack([X_grid[i, 0]**d for d in range(degree + 1)] +
+                                      [X_grid[i, 1]**d for d in range(degree + 1)])
+        forecasted_rt_grid[i] = results.predict(X_poly_grid)
 
+        regression_results.append({
+            'coefficients': results.params,
+            'bandwidth': bandwidth,
+            'degree': degree,
+            'quantile': quantile
+        })
+    grid_results = grid_data.copy()
+    grid_results['Forecasted_RT'] = forecasted_rt_grid
+    return grid_results, regression_results
 
-
-# Function to predict new data points using precomputed model
-def predict_new_points(new_points, precomputed_info):
+def forecast_out_of_sample(new_data, regression_results):
     """
-    Predict values for new data points using precomputed regression model.
-    
-    Parameters:
-        new_points (pd.DataFrame): DataFrame containing new points to predict.
-        precomputed_info (dict): Precomputed model information.
-    
-    Returns:
-        pd.DataFrame: Predictions for the new data points.
+    Forecast RT for out-of-sample data points using the saved regression results.
     """
-    X_data = precomputed_info['X_data']
-    y = precomputed_info['y']
-    degree = precomputed_info['degree']
-    quantile = precomputed_info['quantile']
-    
-    new_points = new_points.values
-    X_new = np.column_stack([new_points**d for d in range(degree + 1)])
-    
-    model = QuantileRegressor(quantile=quantile, alpha=0, solver='highs')
-    model.fit(X_data, y)
-    predictions = model.predict(X_new)
-    
-    return pd.DataFrame({'Predictions': predictions})
+    X_new = new_data[['MODDUR_M', 'ZSPRD_M']].values
+    forecasted_rt_new = np.zeros(len(new_data))
 
-# Example usage
-data = pd.DataFrame({
-    'MODDUR_M': np.random.rand(100),
-    'ZSPRD_M': np.random.rand(100),
-    'RT': np.random.rand(100)
-})
+    for i in range(len(new_data)):
+        results = regression_results[0]  # Using the first grid point's results for simplicity
+        coefficients = results['coefficients']
+        degree = results['degree']
+        X_poly_new = np.column_stack([X_new[i, 0]**d for d in range(degree + 1)] +
+                                     [X_new[i, 1]**d for d in range(degree + 1)])
+        forecasted_rt_new[i] = np.dot(X_poly_new, coefficients)
 
-grid = pd.DataFrame({
-    'MODDUR_M': np.linspace(0, 1, 10),
-    'ZSPRD_M': np.linspace(0, 1, 10)
-})
+    return forecasted_rt_new
 
-# Perform quantile regression and store results
-results, precomputed_info = local_polynomial_quantile_regression(
-    data, grid, x_vars=['MODDUR_M', 'ZSPRD_M'], y_var='RT', quantile=0.99, bandwidth=1.0, degree=1
+
+
+
+# Define the range and number of points for MODDUR_M and ZSPRD_M
+moddur_range = (1, 10)
+zsprd_range = (100, 1000)
+num_points = 10
+
+# Generate the grid data
+grid_data = generate_grid_data(moddur_range, zsprd_range, num_points)
+data = generate_sample_data()
+data_set = dataset(data, 'CUSIP', 5)
+
+# Perform local polynomial quantile regression
+grid_results, regression_results = local_polynomial_quantile_regression_for_grid(
+    data_set, grid_data, kernel_func='gaussian', bandwidth=1.0, degree=2, quantile=0.01
 )
 
-# Predict new points
-new_points = pd.DataFrame({
-    'MODDUR_M': [0.5, 0.6, 0.7],
-    'ZSPRD_M': [0.3, 0.4, 0.5]
+# Create new out-of-sample data points
+new_data = pd.DataFrame({
+    'MODDUR_M': [5.5, 6.5, 7.5],
+    'ZSPRD_M': [1.55, 1.65, 1.75]
 })
 
-predictions = predict_new_points(new_points, precomputed_info)
-print(predictions)
+# Forecast RT for the new data points
+forecasted_rt_new = forecast_out_of_sample(new_data, regression_results)
+new_data['Forecasted_RT'] = forecasted_rt_new
+
+# Display the new data with forecasted RT
+print(new_data)
 
 
 

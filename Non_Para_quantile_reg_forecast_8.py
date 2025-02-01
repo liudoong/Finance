@@ -77,9 +77,8 @@ def uniform_kernel(u):
     """ Uniform kernel function used for weighting. """
     return np.where(np.abs(u) <= 1, 1, 0)
 
-def local_polynomial_quantile_regression(
-    df, grid_data, kernel_func, bandwidth=1, degree=1, quantile=0.01, num_neighbors=None
-):
+def local_polynomial_quantile_regression_for_grid(
+    df, grid_data, kernel_func, bandwidth=1, degree=1, quantile=0.01, num_neighbors=None):
     """
     Perform local polynomial quantile regression using statsmodels.QuantReg with weights.
     """
@@ -95,13 +94,12 @@ def local_polynomial_quantile_regression(
     X = df[['MODDUR_M', 'ZSPRD_M']].values
     y = df['RT'].values
     X_grid = grid_data[['MODDUR_M', 'ZSPRD_M']].values
+
     forecasted_rt_grid = np.zeros(len(grid_data))
-    num_neighbors_used = np.zeros(len(grid_data), dtype=int)  # To store the number of neighbors used
     regression_results = []
 
     for i in range(len(X_grid)):
         distances = np.linalg.norm(X - X_grid[i], axis=1)
-        
         if num_neighbors is not None:
             nearest_indices = np.argsort(distances)[:num_neighbors]
             distances = distances[nearest_indices]
@@ -112,8 +110,6 @@ def local_polynomial_quantile_regression(
             y_nearest = y
 
         weights = kernel(distances / bandwidth)
-        weights = weights / np.sum(weights)  # Normalize weights within the neighborhood
-
         X_poly = np.column_stack([X_nearest[:, 0]**d for d in range(degree + 1)] +
                                  [X_nearest[:, 1]**d for d in range(degree + 1)])
 
@@ -125,11 +121,10 @@ def local_polynomial_quantile_regression(
         # Fit the quantile regression model using statsmodels.QuantReg
         model = QuantReg(y_weighted, X_weighted)
         results = model.fit(q=quantile)
-
+        
         X_poly_grid = np.column_stack([X_grid[i, 0]**d for d in range(degree + 1)] +
                                       [X_grid[i, 1]**d for d in range(degree + 1)])
         forecasted_rt_grid[i] = results.predict(X_poly_grid)
-        num_neighbors_used[i] = len(X_nearest)  # Store the number of neighbors used
 
         regression_results.append({
             'coefficients': results.params,
@@ -137,11 +132,8 @@ def local_polynomial_quantile_regression(
             'degree': degree,
             'quantile': quantile
         })
-
     grid_results = grid_data.copy()
     grid_results['Forecasted_RT'] = forecasted_rt_grid
-    grid_results['Num_Neighbors_Used'] = num_neighbors_used  # Add the number of neighbors used
-
     return grid_results, regression_results
 
 def forecast_out_of_sample(new_data, regression_results):
@@ -161,30 +153,22 @@ def forecast_out_of_sample(new_data, regression_results):
 
     return forecasted_rt_new
 
-min_points = 10  # Minimum number of points required for regression
 
-if num_neighbors is not None:
-    nearest_indices = np.argsort(distances)[:num_neighbors]
-    distances = distances[nearest_indices]
-    X_nearest = X[nearest_indices]
-    y_nearest = y[nearest_indices]
-else:
-    X_nearest = X
-    y_nearest = y
 
-if len(X_nearest) < min_points:
-    warnings.warn(f"Only {len(X_nearest)} points available in the neighborhood. Consider increasing bandwidth.")
 
-weights = kernel(distances / bandwidth)
-weights = weights / np.sum(weights)  # Normalize weights within the neighborhood
+# Define the range and number of points for MODDUR_M and ZSPRD_M
+moddur_range = (1, 10)
+zsprd_range = (100, 1000)
+num_points = 10
 
 # Generate the grid data
-if num_neighbors is not None:
+grid_data = generate_grid_data(moddur_range, zsprd_range, num_points)
 data = generate_sample_data()
+data_set = dataset(data, 'CUSIP', 5)
 
 # Perform local polynomial quantile regression
-grid_results, regression_results = local_polynomial_quantile_regression(
-    data_set, grid_data, kernel_func='gaussian', bandwidth=1.0, degree=1, quantile=0.01, num_neighbors=None
+grid_results, regression_results = local_polynomial_quantile_regression_for_grid(
+    data_set, grid_data, kernel_func='gaussian', bandwidth=1.0, degree=2, quantile=0.01
 )
 
 # Create new out-of-sample data points
