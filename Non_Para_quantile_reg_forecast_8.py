@@ -161,15 +161,26 @@ def forecast_out_of_sample(new_data, regression_results):
 
     return forecasted_rt_new
 
-# Define the range and number of points for MODDUR_M and ZSPRD_M
-moddur_range = (1, 10)
-zsprd_range = (100, 1000)
-num_points = 10
+min_points = 10  # Minimum number of points required for regression
+
+if num_neighbors is not None:
+    nearest_indices = np.argsort(distances)[:num_neighbors]
+    distances = distances[nearest_indices]
+    X_nearest = X[nearest_indices]
+    y_nearest = y[nearest_indices]
+else:
+    X_nearest = X
+    y_nearest = y
+
+if len(X_nearest) < min_points:
+    warnings.warn(f"Only {len(X_nearest)} points available in the neighborhood. Consider increasing bandwidth.")
+
+weights = kernel(distances / bandwidth)
+weights = weights / np.sum(weights)  # Normalize weights within the neighborhood
 
 # Generate the grid data
-grid_data = generate_grid_data(moddur_range, zsprd_range, num_points)
+if num_neighbors is not None:
 data = generate_sample_data()
-data_set = dataset(data, 'CUSIP', 5)
 
 # Perform local polynomial quantile regression
 grid_results, regression_results = local_polynomial_quantile_regression(
