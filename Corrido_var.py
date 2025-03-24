@@ -36,29 +36,28 @@ def variance_swap_pfe(underlying_price, tenor, mpr, quantile, N_vega, strike, po
     # Calculate daily log return
     daily_returns = np.log(underlying_price / underlying_price.shift(-1)).dropna()
     
-    # Define rolling window length for realized variance
-    rolling_window = int(tenor * 252)
+    # Calculate annualized volatility sequence
+    rolling_realized_vol = daily_returns[::-1].rolling(window = 252).std() * 100
+    rolling_realized_vol = rolling_realized_vol[::-1].dropna()
     
-    # Calculate rolling realized variance (annualized)
-    rolling_realized_variance = daily_returns[::-1].rolling(window=rolling_window).var() * 252
-    rolling_realized_variance = rolling_realized_variance[::-1].dropna()
+    # Calculate vol shock over MPR days
+    relative_vol_shock = rolling_realized_vol / rolling_realized_vol.shift(-mpr) - 1
+    relative_vol_shock = relative_rolling_vol_shock.dropna()
     
-    # Calculate variance shocks over MPR days
-    relative_variance_shock = rolling_realized_variance / rolling_realized_variance.shift(-mpr) - 1
-    relative_variance_shock = relative_variance_shock.dropna()
+    # Compute quantile figures for long/short position
+    quantile_shock_vol = (
+        relative_vol_shock.quantile(quantile) if position =="long" else relative_vol_shock.quantile(1 - quantile)
+        )
     
-    # Compute quantile for long/short position
-    quantile_shock_rate = (
-        relative_variance_shock.quantile(quantile) if position == "long" else relative_variance_shock.quantile(1 - quantile)
-    )
+    # Compute payoff based on the shock vol
+    exposure = ((strike * 100 * (1 + quantile_shock_vol))**2 - (strike * 100)**2) / (2 * strike * 100)
     
-    # Use rolling std dev to adjust shock impact
-    realized_shock = quantile_shock_rate * daily_returns.rolling(rolling_window).std().dropna().iloc[-1]
-    
-    # Calculate exposure
-    exposure = N_vega * (realized_shock - strike) / (2 * strike)
+    # Adjust the annualized IA to the tenor length
+    exposure = exposure / np.sqrt(tenor)
     
     return exposure
+    
+
 
 def variance_swap_price(underlying_price, tenor, N_vega, strike, position):
     """
