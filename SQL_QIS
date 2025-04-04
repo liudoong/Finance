@@ -1,42 +1,20 @@
-CREATE PROCEDURE dbo.GetRiskFactorData
-    @BloombergCodes NVARCHAR(MAX),  -- Comma-separated Bloomberg codes
-    @StartDate DATE
-AS
-BEGIN
-    SET NOCOUNT ON;
+SELECT 
+    rf1.TSDate AS TSDate_1, rf1.TSValue AS TSValue_1, rf1.ACCode AS ACCode_1, rf1.BloombergCode AS BloombergCode_1,
+    rf2.TSDate AS TSDate_2, rf2.TSValue AS TSValue_2, rf2.ACCode AS ACCode_2, rf2.BloombergCode AS BloombergCode_2
+FROM 
+    (SELECT rfts.TSDate, rfts.TSValue, rf.ACCode, rf.BloombergCode
+     FROM dbo.RiskFactor rf (NOLOCK)
+     LEFT JOIN dbo.RiskFactorTSLatestView rfts WITH(NOLOCK)
+         ON rfts.RiskFactorId = rf.RiskFactorId
+     WHERE rf.BloombergCode = 'BXIIMWA7' -- 第一个 BloombergCode
+       AND rfts.TSDate > CONVERT(VARCHAR, '2020-01-30', 102)) rf1
+FULL OUTER JOIN 
+    (SELECT rfts.TSDate, rfts.TSValue, rf.ACCode, rf.BloombergCode
+     FROM dbo.RiskFactor rf (NOLOCK)
+     LEFT JOIN dbo.RiskFactorTSLatestView rfts WITH(NOLOCK)
+         ON rfts.RiskFactorId = rf.RiskFactorId
+     WHERE rf.BloombergCode = 'BXFTCS5E' -- 第二个 BloombergCode
+       AND rfts.TSDate > CONVERT(VARCHAR, '2020-01-30', 102)) rf2
+ON rf1.TSDate = rf2.TSDate
+ORDER BY COALESCE(rf1.TSDate, rf2.TSDate) ASC;
 
-    DECLARE @sql NVARCHAR(MAX);
-    
-    -- Generate dynamic pivot columns
-    DECLARE @PivotColumns NVARCHAR(MAX) = '';
-    DECLARE @SelectColumns NVARCHAR(MAX) = '';
-
-    -- Convert Bloomberg codes into dynamic column names
-    SELECT 
-        @PivotColumns = STRING_AGG('MAX(CASE WHEN BloombergCode = ''' + value + ''' THEN TSValue END) AS [' + value + '_TSValue], 
-                                    MAX(CASE WHEN BloombergCode = ''' + value + ''' THEN ACCode END) AS [' + value + '_ACCode]', ', '),
-        @SelectColumns = STRING_AGG('[' + value + '_TSValue], [' + value + '_ACCode]', ', ')
-    FROM STRING_SPLIT(@BloombergCodes, ',');
-
-    -- Construct the full dynamic SQL query
-    SET @sql = '
-    WITH FilteredData AS (
-        SELECT 
-            rfts.TSDate,
-            rf.BloombergCode,
-            rfts.TSValue,
-            rf.ACCode
-        FROM dbo.RiskFactor rf (NOLOCK)
-        LEFT JOIN dbo.RiskFactorTSLatestView rfts WITH(NOLOCK)
-            ON rfts.RiskFactorId = rf.RiskFactorId
-        WHERE rf.BloombergCode IN (' + QUOTENAME(@BloombergCodes, '''') + ')
-        AND rfts.TSDate > @StartDate
-    )
-    SELECT TSDate, ' + @PivotColumns + '
-    FROM FilteredData
-    GROUP BY TSDate
-    ORDER BY TSDate ASC;';
-
-    -- Execute dynamic SQL
-    EXEC sp_executesql @sql, N'@StartDate DATE', @StartDate;
-END;
