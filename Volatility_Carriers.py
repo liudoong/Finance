@@ -408,6 +408,64 @@ def cross_variance_contract_pfe(price1, price2, tenor, mpr, quantile, Notional, 
     
     
     
+ def volatility_swap_pfe(underlying_price, tenor, mpr, quantile, N_vega, strike, position):
+    """
+    Compute Potential Future Exposure (PFE) for Volatility Swap.
+    
+    Parameters
+    ----------
+    underlying_price : pd.Series
+        Historical price series of the underlying
+    tenor : float
+        Maturity in years (e.g., 0.5 for 6 months)
+    mpr : int
+        Margin Period of Risk (in trading days)
+    quantile : float
+        Quantile level for tail (e.g., 0.99)
+    N_vega : float
+        Vega notional
+    strike : float
+        Strike volatility level (e.g., 0.2 for 20%)
+    position : str
+        "long" or "short" (our position on the vol leg)
+
+    Returns
+    -------
+    float
+        PFE value scaled by Vega Notional
+    """
+
+    # Calculate daily log return
+    daily_returns = np.log(underlying_price / underlying_price.shift(1)).dropna()
+
+    # Rolling realized annualized volatility
+    rolling_vol = daily_returns.rolling(252).std() * np.sqrt(252)
+    rolling_vol = rolling_vol.dropna()
+
+    # Absolute shock over MPR days
+    abs_shock = rolling_vol - rolling_vol.shift(mpr)
+    abs_shock = abs_shock.dropna()
+
+    # Select quantile based on position
+    if position == "long":
+        shock_q = abs_shock.quantile(quantile)
+    elif position == "short":
+        shock_q = abs_shock.quantile(1 - quantile)
+    else:
+        raise ValueError("Position must be 'long' or 'short'")
+
+    # Current vol and shocked vol
+    current_vol = rolling_vol.iloc[-1]
+    shocked_vol = max(current_vol + shock_q, 0)
+
+    # Exposure = positive MtM
+    if position == "long":
+        exposure = max(shocked_vol - strike, 0)
+    else:
+        exposure = max(strike - shocked_vol, 0)
+
+    # Scale by Vega Notional
+    return exposure * N_vega 
     
     
     
