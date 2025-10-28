@@ -53,9 +53,19 @@ def simulate_hazard_curves(N, T, dt, inversion_prob=0.024, seed=None):
     Generate hazard rate term structures for N counterparties over T years.
     Shapes: upward, flat, inverted.
     Returns array of shape (N, time_steps)
+    Robust handling for the category probabilities.
     """
     if seed is not None:
         np.random.seed(seed)
+
+    # ensure scalar and float
+    try:
+        inversion_prob = float(inversion_prob)
+    except Exception:
+        raise ValueError(f"inversion_prob must be scalar-convertible to float, got {type(inversion_prob)}")
+
+    if not (0 <= inversion_prob <= 1):
+        raise ValueError(f"inversion_prob must be in [0,1], got {inversion_prob}")
 
     time_steps = int(T / dt)
     hazard_curves = np.zeros((N, time_steps))
@@ -63,12 +73,28 @@ def simulate_hazard_curves(N, T, dt, inversion_prob=0.024, seed=None):
     # Define baseline hazard levels for counterparties
     base_hazard = np.random.uniform(0.01, 0.05, size=N)  # example: 1%-5%
 
-    # Assign curve type
-    curve_type = np.random.choice(
-        ['up', 'flat', 'down'],
-        size=N,
-        p=[0.5*(1-inversion_prob), 0.5, inversion_prob]
-    )
+    # Build probability vector robustly
+    p = np.array([0.5 - 0.5*inversion_prob, 0.5, inversion_prob], dtype=float)
+
+    # Safety: clip negatives to 0 (shouldn't be negative if inversion_prob in [0,1], but just in case)
+    p = np.clip(p, 0.0, None)
+
+    # If due to some reason sum is zero (degenerate), raise
+    s = p.sum()
+    if s == 0 or not np.isfinite(s):
+        raise ValueError(f"Invalid probability vector p={p} with sum={s}")
+
+    # Normalize to exactly 1.0
+    p = p / s
+
+    # Debug prints (can remove after debugging)
+    # print("DEBUG: curve type probabilities p =", p, "sum =", p.sum())
+
+    # Final sanity check for numerical issues
+    if not np.isclose(p.sum(), 1.0, atol=1e-12):
+        raise ValueError(f"Probabilities do not sum to 1 after normalization: sum={p.sum()}, p={p}")
+
+    curve_type = np.random.choice(['up', 'flat', 'down'], size=N, p=p)
 
     for i in range(N):
         slope_factor = np.random.uniform(0.0, 0.05)  # magnitude of slope
@@ -79,7 +105,6 @@ def simulate_hazard_curves(N, T, dt, inversion_prob=0.024, seed=None):
         elif curve_type[i] == 'down':
             hazard_curves[i, :] = base_hazard[i] + slope_factor * np.linspace(1, 0, time_steps)
     return hazard_curves
-
 # -----------------------------
 # Section 3: Constant Hazard
 # -----------------------------
