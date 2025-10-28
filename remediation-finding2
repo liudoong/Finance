@@ -1,0 +1,332 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+Monte Carlo Experiment to Validate Constant Hazard Rate Assumption
+Author: Dong Liu
+Date: 2025-09-19
+
+This script implements a full Monte Carlo simulation for portfolio-level PD
+comparison between term-structured hazard curves (upward, flat, inverted) and
+constant hazard rate assumption. It includes functions, simulation, sensitivity,
+and results visualization.
+"""
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from statsmodels.stats.proportion import proportion_confint
+
+# -----------------------------
+# Section 1: Core Functions
+# -----------------------------
+
+def cumulative_hazard(hazard_curve, dt):
+    """Compute cumulative hazard from hazard curve."""
+    return np.sum(hazard_curve) * dt
+
+def cumulative_PD(cum_hazard):
+    """Compute cumulative default probability from cumulative hazard."""
+    return 1 - np.exp(-cum_hazard)
+
+def portfolio_PD(PDs, weights):
+    """Compute portfolio-level PD as weighted average."""
+    return np.sum(PDs * weights) / np.sum(weights)
+
+def conservative_indicator(D):
+    """Indicator: 1 if constant hazard PD >= term-structured PD, else 0."""
+    return (D >= 0).astype(int)
+
+def clopper_pearson_interval(I, alpha=0.05):
+    """Compute one-sided Clopper-Pearson confidence interval for proportion."""
+    n = len(I)
+    k = np.sum(I)
+    lower, upper = proportion_confint(k, n, alpha=alpha, method='beta')
+    return lower, upper
+
+# -----------------------------
+# Section 2: Hazard Curve Simulation
+# -----------------------------
+
+def simulate_hazard_curves(N, T, dt, inversion_prob=0.024, seed=None):
+    """
+    Generate hazard rate term structures for N counterparties over T years.
+    Shapes: upward, flat, inverted.
+    Returns array of shape (N, time_steps)
+    """
+    if seed is not None:
+        np.random.seed(seed)
+
+    time_steps = int(T / dt)
+    hazard_curves = np.zeros((N, time_steps))
+
+    # Define baseline hazard levels for counterparties
+    base_hazard = np.random.uniform(0.01, 0.05, size=N)  # example: 1%-5%
+
+    # Assign curve type
+    curve_type = np.random.choice(
+        ['up', 'flat', 'down'],
+        size=N,
+        p=[0.5*(1-inversion_prob), 0.5, inversion_prob]
+    )
+
+    for i in range(N):
+        slope_factor = np.random.uniform(0.0, 0.05)  # magnitude of slope
+        if curve_type[i] == 'up':
+            hazard_curves[i, :] = base_hazard[i] + slope_factor * np.linspace(0, 1, time_steps)
+        elif curve_type[i] == 'flat':
+            hazard_curves[i, :] = base_hazard[i]
+        elif curve_type[i] == 'down':
+            hazard_curves[i, :] = base_hazard[i] + slope_factor * np.linspace(1, 0, time_steps)
+    return hazard_curves
+
+# -----------------------------
+# Section 3: Constant Hazard
+# -----------------------------
+
+def compute_constant_hazard_PD(hazard_curves, dt, method='average'):
+    """
+    Compute PD under constant hazard assumption.
+    method: 'average', 'short', 'max'
+    Returns array of portfolio PD per counterparty
+    """
+    N, time_steps = hazard_curves.shape
+    if method == 'average':
+        h_c = hazard_curves.mean(axis=1)
+    elif method == 'short':
+        h_c = hazard_curves[:, 0]
+    elif method == 'max':
+        h_c = np.maximum(hazard_curves[:, 0], hazard_curves.mean(axis=1))
+    else:
+        raise ValueError("Unknown method for constant hazard")
+    Lambda_c = h_c * dt * time_steps
+    PD_c = cumulative_PD(Lambda_c)
+    return PD_c
+
+# -----------------------------
+# Section 4: Monte Carlo Simulation
+# -----------------------------
+
+def run_monte_carlo(N=2000, T=5, dt=0.25, M=50000, inversion_prob=0.024, seed=None):
+    """
+    Run full Monte Carlo experiment and compute D and conservative proportion.
+    """
+    if seed is not None:
+        np.random.seed(seed)
+
+    # Initialize arrays
+    D_all = np.zeros(M)
+    weights = np.ones(N)  # equal weight portfolio; can replace with EAD/notional
+
+    for m in range(M):
+        hazard_curves = simulate_hazard_curves(N, T, dt, inversion_prob)
+        PD_term = np.array([cumulative_PD(cumulative_hazard(h, dt)) for h in hazard_curves])
+        portfolio_PD_term = portfolio_PD(PD_term, weights)
+
+        PD_const = compute_constant_hazard_PD(hazard_curves, dt, method='average')
+        portfolio_PD_const = portfolio_PD(PD_const, weights)
+
+        D_all[m] = portfolio_PD_const - portfolio_PD_term
+
+        if (m+1) % 5000 == 0:
+            print(f"Simulation {m+1}/{M} completed")
+
+    # Compute conservative proportion
+    I = conservative_indicator(D_all)
+    hat_p = np.mean(I)
+    ci_lower, ci_upper = clopper_pearson_interval(I)
+
+    return D_all, hat_p, ci_lower, ci_upper
+
+# -----------------------------
+# Section 5: Results Visualization
+# -----------------------------
+
+def plot_results(D_all):
+    """Plot histogram and KDE of D."""
+    plt.figure(figsize=(10,6))
+    sns.histplot(D_all, kde=True, bins=50)
+    plt.axvline(0, color='red', linestyle='--', label='D=0')
+    plt.title("Distribution of D = PortfolioPD_const - PortfolioPD_term")
+    plt.xlabel("D")
+    plt.ylabel("Frequency")
+    plt.legend()
+    plt.show()
+
+# -----------------------------
+# Section 6: Main Execution
+# -----------------------------
+
+if __name__ == "__main__":
+    # Parameters
+    N = 2000           # portfolio size
+    T = 5              # years
+    dt = 0.25          # quarterly step
+    M = 50000          # number of Monte Carlo replications
+    inversion_prob = 0.024
+    seed = 42
+
+    # Run Monte Carlo
+    D_all, hat_p, ci_lower, ci_upper = run_monte_carlo(
+        N=N, T=T, dt=dt, M=M, inversion_prob=inversion_prob, seed=seed
+    )
+
+    # Display results
+    print(f"Proportion of conservative outcomes (hat_p): {hat_p:.4f}")
+    print(f"95% Clopper-Pearson confidence interval: [{ci_lower:.4f}, {ci_upper:.4f}]")
+
+    # Plot distribution
+    plot_results(D_all)
+
+
+
+
+
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+Monte Carlo Experiment with Sensitivity Analysis
+Author: Dong Liu
+Date: 2025-09-19
+
+This script extends the previous Monte Carlo prototype by performing
+sensitivity analysis across:
+- inversion proportions
+- portfolio sizes
+- constant hazard calibration methods
+and visualizes the results.
+"""
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from statsmodels.stats.proportion import proportion_confint
+
+# -----------------------------
+# Core Functions (same as before)
+# -----------------------------
+
+def cumulative_hazard(hazard_curve, dt):
+    return np.sum(hazard_curve) * dt
+
+def cumulative_PD(cum_hazard):
+    return 1 - np.exp(-cum_hazard)
+
+def portfolio_PD(PDs, weights):
+    return np.sum(PDs * weights) / np.sum(weights)
+
+def conservative_indicator(D):
+    return (D >= 0).astype(int)
+
+def clopper_pearson_interval(I, alpha=0.05):
+    n = len(I)
+    k = np.sum(I)
+    lower, upper = proportion_confint(k, n, alpha=alpha, method='beta')
+    return lower, upper
+
+def simulate_hazard_curves(N, T, dt, inversion_prob=0.024, seed=None):
+    if seed is not None:
+        np.random.seed(seed)
+    time_steps = int(T / dt)
+    hazard_curves = np.zeros((N, time_steps))
+    base_hazard = np.random.uniform(0.01, 0.05, size=N)
+    curve_type = np.random.choice(
+        ['up', 'flat', 'down'],
+        size=N,
+        p=[0.5*(1-inversion_prob), 0.5, inversion_prob]
+    )
+    for i in range(N):
+        slope_factor = np.random.uniform(0.0, 0.05)
+        if curve_type[i] == 'up':
+            hazard_curves[i, :] = base_hazard[i] + slope_factor * np.linspace(0, 1, time_steps)
+        elif curve_type[i] == 'flat':
+            hazard_curves[i, :] = base_hazard[i]
+        elif curve_type[i] == 'down':
+            hazard_curves[i, :] = base_hazard[i] + slope_factor * np.linspace(1, 0, time_steps)
+    return hazard_curves
+
+def compute_constant_hazard_PD(hazard_curves, dt, method='average'):
+    N, time_steps = hazard_curves.shape
+    if method == 'average':
+        h_c = hazard_curves.mean(axis=1)
+    elif method == 'short':
+        h_c = hazard_curves[:, 0]
+    elif method == 'max':
+        h_c = np.maximum(hazard_curves[:, 0], hazard_curves.mean(axis=1))
+    else:
+        raise ValueError("Unknown method for constant hazard")
+    Lambda_c = h_c * dt * time_steps
+    PD_c = cumulative_PD(Lambda_c)
+    return PD_c
+
+def run_single_simulation(N, T, dt, inversion_prob, constant_method, seed=None):
+    hazard_curves = simulate_hazard_curves(N, T, dt, inversion_prob, seed)
+    PD_term = np.array([cumulative_PD(cumulative_hazard(h, dt)) for h in hazard_curves])
+    portfolio_PD_term = portfolio_PD(PD_term, np.ones(N))
+    PD_const = compute_constant_hazard_PD(hazard_curves, dt, method=constant_method)
+    portfolio_PD_const = portfolio_PD(PD_const, np.ones(N))
+    D = portfolio_PD_const - portfolio_PD_term
+    I = conservative_indicator(D)
+    hat_p = np.mean(I)
+    ci_lower, ci_upper = clopper_pearson_interval(I)
+    return hat_p, ci_lower, ci_upper, D
+
+# -----------------------------
+# Sensitivity Analysis Parameters
+# -----------------------------
+
+portfolio_sizes = [200, 1000, 2000]
+inversion_probs = [0.024, 0.05, 0.10, 0.20]
+constant_methods = ['average', 'short', 'max']
+T = 5
+dt = 0.25
+M = 10000  # reduce for demo, increase for final run
+seed_base = 42
+
+results = []
+
+# -----------------------------
+# Section 6: Sensitivity Analysis Loop
+# -----------------------------
+
+for N in portfolio_sizes:
+    for inversion_prob in inversion_probs:
+        for method in constant_methods:
+            print(f"Running N={N}, inversion={inversion_prob*100:.1f}%, method={method}")
+            # Run Monte Carlo
+            np.random.seed(seed_base)
+            D_all = np.zeros(M)
+            for m in range(M):
+                _, _, _, D = run_single_simulation(N, T, dt, inversion_prob, method)
+                D_all[m] = D
+            I = conservative_indicator(D_all)
+            hat_p = np.mean(I)
+            ci_lower, ci_upper = clopper_pearson_interval(I)
+            results.append({
+                'N': N,
+                'inversion_prob': inversion_prob,
+                'constant_method': method,
+                'hat_p': hat_p,
+                'ci_lower': ci_lower,
+                'ci_upper': ci_upper
+            })
+            # Optional: quick plot per scenario
+            plt.figure(figsize=(8,5))
+            sns.histplot(D_all, kde=True, bins=50)
+            plt.axvline(0, color='red', linestyle='--', label='D=0')
+            plt.title(f"D distribution, N={N}, inversion={inversion_prob*100:.1f}%, method={method}")
+            plt.xlabel("D")
+            plt.ylabel("Frequency")
+            plt.legend()
+            plt.show()
+
+# -----------------------------
+# Save and display summary
+# -----------------------------
+
+results_df = pd.DataFrame(results)
+results_df.to_csv("sensitivity_analysis_results.csv", index=False)
+print("\nSensitivity Analysis Summary:")
+print(results_df)
+
