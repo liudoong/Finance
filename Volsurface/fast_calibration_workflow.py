@@ -1,5 +1,5 @@
 """
-波动率曲面校准 - 线性工作流脚本
+波动率曲面校准 - 线性工作流脚本 (Updated 2026-01-15)
 
 这是一个逐步执行的脚本，方便理解每个步骤的输入输出。
 你可以在Jupyter或IDE中逐块运行，观察每一步的结果。
@@ -7,12 +7,24 @@
 完整流程：
   Step 1: 提取期权数据
   Step 2: 数据采样（加速校准）
-  Step 3: 校准模型参数
+  Step 3: 校准模型参数 (支持平滑校准以避免bumps)
   Step 4: 查看波动率曲面
   Step 5: 测试插值功能
   Step 6: 导出到QuantLib
   Step 7: 保存结果到CSV
   Step 8: 可视化波动率曲面
+
+新增功能：
+  - 平滑校准（USE_SMOOTH_CALIBRATION=True）以减少曲面bumps和过拟合
+  - 数据质量过滤（FILTER_DATA=True）移除异常值和低流动性期权
+  - 正则化参数（REGULARIZATION）控制平滑强度
+  - 参数连续性检查（检测参数跳跃）
+
+推荐设置：
+  - USE_SMOOTH_CALIBRATION = True
+  - REGULARIZATION = 0.01 (中度平滑)
+  - FILTER_DATA = True
+  - OUTLIER_THRESHOLD = 2.5
 """
 
 import pandas as pd
@@ -21,6 +33,7 @@ import time
 from option_data_cleaner import extract_options_data
 from data_subsampler import subsample_options_data
 from vol_surface_calibrator import calibrate_vol_surface
+from smooth_calibrator import smooth_calibrate_vol_surface
 from plot_vol_surface import plot_volatility_surface, plot_sabr_parameters
 
 
@@ -28,12 +41,38 @@ from plot_vol_surface import plot_volatility_surface, plot_sabr_parameters
 # 配置参数 - 可以根据需要修改
 # =============================================================================
 
-INPUT_FILE = "spx_data.xlsx"  # 输入Excel文件
+INPUT_FILE = "spx_data.xlsx"              # 输入Excel文件
 MODEL = 'SABR'                            # 'SABR' 或 'Heston'
+
+# ===== 平滑校准设置 (新增功能，推荐使用) =====
+USE_SMOOTH_CALIBRATION = True             # 是否使用平滑校准（推荐：True，减少bumps和过拟合）
+REGULARIZATION = 0.05                     # 平滑校准的正则化强度
+                                          #   0.0   = 无平滑（原始校准）
+                                          #   0.005 = 轻度平滑
+                                          #   0.01  = 中度平滑 ★ 推荐
+                                          #   0.05  = 强平滑
+                                          #   0.1   = 极强平滑（可能过度）
+
+FILTER_DATA = True                        # 是否过滤低质量数据（推荐：True）
+                                          # 会移除：异常值、低流动性、深度价内/价外期权
+
+OUTLIER_THRESHOLD = 1.5                   # 异常值Z-score阈值（推荐：2.0，更严格）
+                                          # 较小值 = 更严格的过滤
+                                          # 如果数据质量差，使用1.5更激进
+
+# ===== 其他参数 =====
 NUM_STRIKES_SUBSAMPLE = 30                # 采样：每个到期日保留多少个期权（控制速度）
 NUM_STRIKES_OUTPUT = 80                   # 输出：曲面包含多少个行权价（控制分辨率）
-RISK_FREE_RATE = 0.0375                     # 无风险利率
+RISK_FREE_RATE = 0.05                     # 无风险利率
 MIN_MATURITY_DAYS = 7                     # 过滤掉到期日太近的期权
+
+# ===== 快速设置模板 =====
+# 场景1：追求最平滑的曲面
+#   USE_SMOOTH_CALIBRATION = True, REGULARIZATION = 0.05, FILTER_DATA = True
+# 场景2：平衡平滑度和拟合精度（推荐）
+#   USE_SMOOTH_CALIBRATION = True, REGULARIZATION = 0.01, FILTER_DATA = True
+# 场景3：原始校准（可能有bumps）
+#   USE_SMOOTH_CALIBRATION = False
 
 
 # =============================================================================
@@ -112,21 +151,44 @@ print("\n\n" + "="*80)
 print("STEP 3: 校准波动率模型")
 print("="*80)
 print(f"\n模型: {MODEL}")
+print(f"使用平滑校准: {USE_SMOOTH_CALIBRATION}")
+if USE_SMOOTH_CALIBRATION:
+    print(f"正则化强度: {REGULARIZATION}")
+    print(f"数据过滤: {FILTER_DATA}")
+    print(f"异常值阈值: {OUTLIER_THRESHOLD}")
 print(f"校准数据: {len(df_subsampled)} 个期权")
 print(f"输出曲面: {NUM_STRIKES_OUTPUT} 个行权价")
 print("\n开始校准...\n")
 
 start_time = time.time()
-result = calibrate_vol_surface(
-    df_subsampled,
-    model=MODEL,
-    risk_free_rate=RISK_FREE_RATE,
-    min_maturity_days=MIN_MATURITY_DAYS,
-    output_strikes=NUM_STRIKES_OUTPUT
-)
+
+if USE_SMOOTH_CALIBRATION and MODEL.upper() == 'SABR':
+    # 使用平滑校准（推荐：减少bumps和过拟合）
+    result = smooth_calibrate_vol_surface(
+        df_subsampled,
+        model=MODEL,
+        regularization=REGULARIZATION,
+        filter_data=FILTER_DATA,
+        outlier_threshold=OUTLIER_THRESHOLD,
+        risk_free_rate=RISK_FREE_RATE,
+        output_strikes=NUM_STRIKES_OUTPUT
+    )
+    calibration_method = "Smooth (with regularization)"
+else:
+    # 使用原始校准
+    result = calibrate_vol_surface(
+        df_subsampled,
+        model=MODEL,
+        risk_free_rate=RISK_FREE_RATE,
+        min_maturity_days=MIN_MATURITY_DAYS,
+        output_strikes=NUM_STRIKES_OUTPUT
+    )
+    calibration_method = "Standard"
+
 calibration_time = time.time() - start_time
 
 print(f"\n✓ 校准完成 (用时 {calibration_time:.1f} 秒)")
+print(f"  校准方法: {calibration_method}")
 
 # 提取结果
 surface = result['surface']
@@ -135,6 +197,9 @@ spot = result['spot_price']
 
 print(f"\n校准结果摘要:")
 print(f"  模型: {MODEL}")
+print(f"  校准方法: {calibration_method}")
+if USE_SMOOTH_CALIBRATION:
+    print(f"  正则化: λ={REGULARIZATION}")
 print(f"  校准时间: {calibration_time:.1f} 秒")
 print(f"  现货价格: {spot:.2f}")
 
@@ -147,6 +212,14 @@ if MODEL == 'SABR':
         print(f"    T={T:.2f}年: α={p['alpha']:.4f}, β={p['beta']:.2f}, ρ={p['rho']:.4f}, ν={p['nu']:.4f}")
     if len(params) > 5:
         print(f"    ... (共 {len(params)} 个到期日)")
+
+    # 计算参数平滑度（仅当有多个到期日时）
+    if len(params) > 1:
+        maturities = sorted(params.keys())
+        alphas = [params[T]['alpha'] for T in maturities]
+        max_alpha_jump = max([abs(alphas[i+1] - alphas[i]) for i in range(len(alphas)-1)])
+        print(f"\n  参数连续性检查:")
+        print(f"    最大α跳跃: {max_alpha_jump:.4f} ({'平滑 ✓' if max_alpha_jump < 0.05 else '可能有bumps ⚠'})")
 else:  # Heston
     print(f"\n  Heston参数 (全局参数):")
     for key, value in params.items():
@@ -351,7 +424,7 @@ try:
     plot_volatility_surface(
         result,
         save_path=f'vol_surface_{MODEL.lower()}_analysis.png',
-        show=False  # 设置为False避免阻塞，图片会保存
+        show=True  # 设置为False避免阻塞，图片会保存
     )
     print(f"✓ 波动率曲面分析图已保存: vol_surface_{MODEL.lower()}_analysis.png")
 
@@ -360,7 +433,7 @@ try:
         plot_sabr_parameters(
             result,
             save_path=f'sabr_parameters_{MODEL.lower()}.png',
-            show=False
+            show=True
         )
         print(f"✓ SABR参数演化图已保存: sabr_parameters_{MODEL.lower()}.png")
 
@@ -385,6 +458,8 @@ print("\n\n" + "="*80)
 print("完成！工作流总结")
 print("="*80)
 
+smoothing_status = f"  校准方法: {'平滑校准 (λ=' + str(REGULARIZATION) + ')' if USE_SMOOTH_CALIBRATION else '标准校准'}"
+
 print(f"""
 数据流转:
   {len(df_raw)} 个原始期权
@@ -392,6 +467,10 @@ print(f"""
   {len(df_subsampled)} 个期权用于校准
       ↓ ({MODEL}模型校准)
   {len(surface.strikes)} × {len(surface.maturities)} 波动率曲面
+
+校准配置:
+{smoothing_status}
+  数据过滤: {'是' if FILTER_DATA and USE_SMOOTH_CALIBRATION else '否'}
 
 时间:
   数据提取: {elapsed:.1f} 秒
@@ -406,10 +485,16 @@ print(f"""
 
 下一步:
   1. 打开 vol_surface_{MODEL.lower()}_analysis.png 查看完整的曲面分析
-  2. 在Excel中打开 vol_surface_grid.csv 查看数据
-  3. 用波动率曲面定价奇异期权
-  4. 将QuantLib曲面用于蒙特卡洛模拟
-  5. 比较不同模型的校准结果
+  2. 检查曲面是否平滑，无异常bumps
+  3. 如果看到bumps，设置 USE_SMOOTH_CALIBRATION=True 或增加 REGULARIZATION
+  4. 在Excel中打开 vol_surface_grid.csv 查看数据
+  5. 用波动率曲面定价奇异期权
+  6. 将QuantLib曲面用于蒙特卡洛模拟
+
+提示:
+  • 推荐使用平滑校准以获得更稳定的曲面
+  • 查看 SMOOTHING_GUIDE.md 了解详细的参数调优建议
+  • 运行 test_smooth_calibration.py 对比不同校准方法
 """)
 
 print("="*80)
