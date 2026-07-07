@@ -316,3 +316,94 @@ if __name__ == "__main__":
     pd.set_option('display.float_format', lambda x: f'{x:.4f}')
     print(vol_surface)
 
+
+
+
+
+
+
+
+import numpy as np
+import pandas as pd
+
+def generate_fake_vol_surface(
+    itm_vol_short, atm_vol_short, otm_vol_short,   # 短端(1M)三个真实implied vol锚点
+    itm_vol_long,  atm_vol_long,  otm_vol_long,    # 长端(10Y)三个真实implied vol锚点
+    itm_moneyness=0.90,   # ITM锚点对应的moneyness（K/S）
+    otm_moneyness=1.10,   # OTM锚点对应的moneyness
+    term_decay=0.35,      # 期限结构从短端过渡到长端的衰减速度（唯一的自由形状参数）
+    seed=42
+):
+    """
+    用6个真实implied vol锚点（短端/长端各三个：ITM, ATM, OTM）构造vol surface。
+    
+    方法：
+    1. 在短端和长端，分别用(itm, atm, otm)三点在对数moneyness空间拟合一条抛物线
+       vol(k) = a + b*k + c*k^2，三个点唯一确定(a,b,c)——不需要额外假设。
+    2. 对任意期限tau，用指数衰减 w(tau) 在"短端抛物线系数"和"长端抛物线系数"之间插值：
+       (a,b,c)(tau) = (a,b,c)_long + [(a,b,c)_short - (a,b,c)_long] * exp(-term_decay * tau)
+       这样短端自动收敛到短端锚点形状，长端自动收敛到长端锚点形状，中间平滑过渡。
+    3. term_decay 是唯一无法从6个真实vol直接反推的参数，因为6个点只描述了两个期限截面，
+       中间期限的过渡速度必须额外指定。
+    
+    Returns
+    -------
+    pd.DataFrame，index为tenor标签，columns为moneyness标签，值为implied vol
+    """
+    np.random.seed(seed)
+
+    tenors_labels = ['1M','2M','3M','6M','9M','1Y','18M','2Y','3Y','4Y','5Y','7Y','10Y']
+    tenors_yrs    = np.array([1/12, 2/12, 3/12, 6/12, 9/12, 1, 1.5, 2, 3, 4, 5, 7, 10])
+
+    moneyness_labels = ['80%','90%','95%','97.5%','100%','102.5%','105%','110%','120%']
+    moneyness_vals    = np.array([0.80,0.90,0.95,0.975,1.00,1.025,1.05,1.10,1.20])
+    log_moneyness     = np.log(moneyness_vals)
+
+    def fit_parabola(k_itm, v_itm, k_atm, v_atm, k_otm, v_otm):
+        """用三点(k, vol)唯一解出 vol = a + b*k + c*k^2 的系数"""
+        A = np.array([
+            [1, k_itm, k_itm**2],
+            [1, k_atm, k_atm**2],
+            [1, k_otm, k_otm**2],
+        ])
+        y = np.array([v_itm, v_atm, v_otm])
+        a, b, c = np.linalg.solve(A, y)
+        return a, b, c
+
+    k_itm = np.log(itm_moneyness)
+    k_atm = 0.0
+    k_otm = np.log(otm_moneyness)
+
+    # 短端、长端各自唯一确定的抛物线系数
+    a_s, b_s, c_s = fit_parabola(k_itm, itm_vol_short, k_atm, atm_vol_short, k_otm, otm_vol_short)
+    a_l, b_l, c_l = fit_parabola(k_itm, itm_vol_long,  k_atm, atm_vol_long,  k_otm, otm_vol_long)
+
+    # --- 期限间插值权重：短端权重随tau指数衰减到0 ---
+    w_short = np.exp(-term_decay * tenors_yrs)   # tau=0 → 1（完全是短端形状）；tau大 → 0（完全是长端形状）
+
+    a_t = a_l + (a_s - a_l) * w_short
+    b_t = b_l + (b_s - b_l) * w_short
+    c_t = c_l + (c_s - c_l) * w_short
+
+    # --- 组装 surface ---
+    surface = np.zeros((len(tenors_yrs), len(moneyness_vals)))
+    for i in range(len(tenors_yrs)):
+        surface[i, :] = a_t[i] + b_t[i] * log_moneyness + c_t[i] * log_moneyness**2
+
+    surface = np.clip(surface, 0.01, None)  # 防御性下限，避免退化出负vol
+
+    df = pd.DataFrame(surface, index=tenors_labels, columns=moneyness_labels)
+    return df
+
+
+# --- 快速验证：用一组虚构但看起来合理的真实vol水平 ---
+if __name__ == "__main__":
+    vol_surface = generate_fake_vol_surface(
+        itm_vol_short=0.32, atm_vol_short=0.26, otm_vol_short=0.30,
+        itm_vol_long=0.22,  atm_vol_long=0.19,  otm_vol_long=0.20,
+        term_decay=0.35
+    )
+    pd.set_option('display.float_format', lambda x: f'{x:.4f}')
+    print(vol_surface)
+
+
