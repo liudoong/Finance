@@ -1,0 +1,242 @@
+"""
+Heston波动率曲面学习用数据获取 Pipeline
+=========================================
+目的: 从 Yahoo Finance (yfinance) 拉取单个标的当日的期权链数据,
+      自行反解Black-Scholes隐含波动率,组装成一个可直接喂给
+      Heston / SVI 校准代码的 volatility surface。
+
+【重要】本脚本仅用于个人学习/研究,不适合生产环境:
+  - yfinance 是非官方接口,可能随时因 Yahoo 改版而失效
+  - 已内置节流(throttle)与重试(retry)逻辑以降低被限流(HTTP 429)的概率,
+    但无法保证100%不被限流
+  - 数据存在约15分钟延迟,且 bid/ask 在流动性差的合约上可能不可靠
+
+依赖安装:
+  pip install yfinance pandas numpy scipy matplotlib
+
+============================================================
+【输入参数说明 —— 全部在下面 CONFIG 区域修改】
+============================================================
+TICKER          : 标的代码,例如 "SPY" "QQQ" "AAPL"。建议用高流动性ETF/大盘股,
+                   IV才不会太噪。
+MIN_DAYS        : 只保留到期天数 >= 此值的合约(太短期的0DTE噪声大,建议 >=7)
+MAX_DAYS        : 只保留到期天数 <= 此值的合约(太长期流动性差,建议 <=365)
+MAX_EXPIRIES    : 最多抓取多少个到期日,避免一次抓太多触发限流(建议 6~12)
+MONEYNESS_BAND  : 只保留 strike/spot 落在 [1-band, 1+band] 区间内的合约,
+                   过滤深度实值/虚值的噪声报价(建议 0.3 即 70%~130%)
+MIN_VOLUME      : 过滤掉当日成交量小于此值的合约(0表示不过滤,但噪声会变大)
+REQUEST_SLEEP   : 每次请求之间的等待秒数(节流,建议 1.5~3 秒)
+RISK_FREE_RATE  : 无风险利率,若不想额外拉美债收益率数据,给一个近似值即可
+DIV_YIELD       : 标的股息率,ETF可查Yahoo summary,或直接给近似值
+OUTPUT_CSV      : 输出的surface数据文件路径
+============================================================
+"""
+
+import time
+import random
+import datetime as dt
+from dataclasses import dataclass
+
+import numpy as np
+import pandas as pd
+from scipy.stats import norm
+from scipy.optimize import brentq
+
+# ============================================================
+# CONFIG —— 在这里改你的输入参数
+# ============================================================
+TICKER = "SPY"
+MIN_DAYS = 7
+MAX_DAYS = 365
+MAX_EXPIRIES = 10
+MONEYNESS_BAND = 0.30
+MIN_VOLUME = 1
+REQUEST_SLEEP = 2.0          # 每次请求之间固定等待秒数
+REQUEST_JITTER = 1.0         # 额外随机抖动(0~1秒),避免请求节奏过于规律
+MAX_RETRIES = 4              # 单次请求最大重试次数
+BACKOFF_BASE = 30            # 遇到429后第一次退避等待秒数(指数增长)
+RISK_FREE_RATE = 0.045       # 近似无风险利率,可按需替换成当日实际值
+DIV_YIELD = 0.013            # 近似股息率(SPY约1.3%左右,自行核实调整)
+OUTPUT_CSV = "vol_surface_today.csv"
+
+
+# ============================================================
+# 第一部分: 带节流与重试的 yfinance 请求封装
+# ============================================================
+def throttled_call(func, *args, **kwargs):
+    """
+    对任意 yfinance 调用加节流 + 429重试。
+    - 每次调用前先 sleep(固定间隔 + 随机抖动),降低请求频率的规律性
+    - 遇到疑似限流错误时,做指数退避重试
+    """
+    last_err = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        # 节流: 每次请求前都等待一小段时间
+        time.sleep(REQUEST_SLEEP + random.uniform(0, REQUEST_JITTER))
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            last_err = e
+            msg = str(e).lower()
+            is_rate_limited = ("429" in msg) or ("too many requests" in msg) or ("rate" in msg)
+            wait = BACKOFF_BASE * (2 ** (attempt - 1)) if is_rate_limited else 5 * attempt
+            print(f"  [warn] 第{attempt}次请求失败: {e}")
+            print(f"  [warn] {'疑似被限流,' if is_rate_limited else ''}等待 {wait:.0f} 秒后重试...")
+            time.sleep(wait)
+    raise RuntimeError(f"多次重试后仍失败: {last_err}")
+
+
+# ============================================================
+# 第二部分: 抓取当日期权链
+# ============================================================
+def fetch_option_chain(ticker_symbol: str) -> pd.DataFrame:
+    import yfinance as yf
+
+    tk = yf.Ticker(ticker_symbol)
+
+    # 1) 拿现价 (1次请求)
+    print(f"[1/3] 获取 {ticker_symbol} 现价...")
+    hist = throttled_call(tk.history, period="1d")
+    if hist.empty:
+        raise RuntimeError("无法获取现价,请检查ticker或网络")
+    spot = float(hist["Close"].iloc[-1])
+    print(f"  现价 = {spot:.2f}")
+
+    # 2) 拿可用到期日列表 (1次请求)
+    print(f"[2/3] 获取可用到期日列表...")
+    all_expiries = throttled_call(lambda: tk.options)
+    today = dt.date.today()
+
+    selected = []
+    for exp_str in all_expiries:
+        exp_date = dt.datetime.strptime(exp_str, "%Y-%m-%d").date()
+        days = (exp_date - today).days
+        if MIN_DAYS <= days <= MAX_DAYS:
+            selected.append((exp_str, days))
+    selected = selected[:MAX_EXPIRIES]
+
+    if not selected:
+        raise RuntimeError("没有满足 MIN_DAYS/MAX_DAYS 条件的到期日,请调整CONFIG")
+
+    print(f"  共选中 {len(selected)} 个到期日: {[s[0] for s in selected]}")
+
+    # 3) 逐个到期日拉取期权链 (每个到期日 1次请求, 串行 + 节流)
+    print(f"[3/3] 逐个抓取期权链(每次请求间隔约{REQUEST_SLEEP}秒)...")
+    rows = []
+    for i, (exp_str, days) in enumerate(selected, 1):
+        print(f"  ({i}/{len(selected)}) 抓取 {exp_str} (T={days}天)...")
+        chain = throttled_call(tk.option_chain, exp_str)
+
+        for opt_type, df in [("call", chain.calls), ("put", chain.puts)]:
+            if df.empty:
+                continue
+            tmp = df.copy()
+            tmp["expiry"] = exp_str
+            tmp["days_to_expiry"] = days
+            tmp["option_type"] = opt_type
+            rows.append(tmp)
+
+    raw = pd.concat(rows, ignore_index=True)
+    raw["spot"] = spot
+    return raw
+
+
+# ============================================================
+# 第三部分: 清洗 + 用 mid price 自行反解 Black-Scholes IV
+# ============================================================
+def bs_price(S, K, T, r, q, sigma, option_type):
+    if sigma <= 0 or T <= 0:
+        return np.nan
+    d1 = (np.log(S / K) + (r - q + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
+    d2 = d1 - sigma * np.sqrt(T)
+    if option_type == "call":
+        return S * np.exp(-q * T) * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
+    else:
+        return K * np.exp(-r * T) * norm.cdf(-d2) - S * np.exp(-q * T) * norm.cdf(-d1)
+
+
+def implied_vol_from_price(price, S, K, T, r, q, option_type):
+    """用 Brent 方法反解 IV,比 Newton-Raphson 更稳健,不用给初值/导数。"""
+    intrinsic = max(S * np.exp(-q * T) - K * np.exp(-r * T), 0) if option_type == "call" \
+        else max(K * np.exp(-r * T) - S * np.exp(-q * T), 0)
+    if price <= intrinsic:
+        return np.nan  # 价格低于内在价值,无法反解出合理IV(报价噪声)
+
+    def objective(sigma):
+        return bs_price(S, K, T, r, q, sigma, option_type) - price
+
+    try:
+        return brentq(objective, 1e-4, 5.0, xtol=1e-6, maxiter=200)
+    except ValueError:
+        return np.nan
+
+
+def clean_and_build_surface(raw: pd.DataFrame) -> pd.DataFrame:
+    df = raw.copy()
+    spot = df["spot"].iloc[0]
+
+    # 用 mid price 而不是 lastPrice(更接近当前市场共识,且不受最后一次成交时间影响)
+    df["mid"] = (df["bid"] + df["ask"]) / 2.0
+    df = df[(df["bid"] > 0) & (df["ask"] > 0)]  # 过滤挂零价的僵尸合约
+
+    df = df[df["volume"].fillna(0) >= MIN_VOLUME]
+
+    df["moneyness"] = df["strike"] / spot
+    df = df[(df["moneyness"] >= 1 - MONEYNESS_BAND) & (df["moneyness"] <= 1 + MONEYNESS_BAND)]
+
+    df["T"] = df["days_to_expiry"] / 365.0
+
+    # 自行反解IV(不用Yahoo自带的 impliedVolatility 列,那一列质量不稳定)
+    print("正在反解 Black-Scholes 隐含波动率...")
+    df["iv_calc"] = df.apply(
+        lambda row: implied_vol_from_price(
+            row["mid"], spot, row["strike"], row["T"],
+            RISK_FREE_RATE, DIV_YIELD, row["option_type"]
+        ),
+        axis=1,
+    )
+
+    df = df.dropna(subset=["iv_calc"])
+    df = df[(df["iv_calc"] > 0.01) & (df["iv_calc"] < 3.0)]  # 过滤明显异常值
+
+    # OTM惯例: strike < spot 用put的IV, strike >= spot 用call的IV
+    # (OTM期权流动性通常更好,报价噪声更小,这是业界构建vol surface的常见做法)
+    otm_mask = ((df["option_type"] == "put") & (df["strike"] < spot)) | \
+               ((df["option_type"] == "call") & (df["strike"] >= spot))
+    df = df[otm_mask]
+
+    surface = df[[
+        "expiry", "days_to_expiry", "T", "option_type",
+        "strike", "moneyness", "bid", "ask", "mid",
+        "volume", "openInterest", "impliedVolatility", "iv_calc"
+    ]].rename(columns={"impliedVolatility": "iv_yahoo", "iv_calc": "iv_bs"})
+
+    surface = surface.sort_values(["days_to_expiry", "strike"]).reset_index(drop=True)
+    surface.attrs["spot"] = spot
+    return surface
+
+
+# ============================================================
+# 主流程
+# ============================================================
+def main():
+    print(f"=== 抓取 {TICKER} 当日波动率曲面 (学习用途) ===\n")
+    raw = fetch_option_chain(TICKER)
+    surface = clean_and_build_surface(raw)
+
+    surface.to_csv(OUTPUT_CSV, index=False)
+    print(f"\n完成。共 {len(surface)} 个有效报价点,已保存至 {OUTPUT_CSV}")
+    print(f"现货价格: {raw['spot'].iloc[0]:.2f}")
+    print("\n各到期日数据点数量:")
+    print(surface.groupby(["expiry", "days_to_expiry"]).size())
+
+    # 简单预览: 每个到期日的ATM附近IV
+    print("\nATM附近IV预览(moneyness 0.95~1.05):")
+    atm = surface[(surface["moneyness"] >= 0.95) & (surface["moneyness"] <= 1.05)]
+    print(atm.groupby("days_to_expiry")["iv_bs"].mean().round(4))
+
+    return surface
+
+
+if __name__ == "__main__":
+    surface_df = main()
