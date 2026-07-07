@@ -238,5 +238,81 @@ def main():
     return surface
 
 
+
+
+
+
+
+
+
+import numpy as np
+import pandas as pd
+
+def generate_fake_vol_surface(
+    atm_vol_short=0.28,      # 短端(1M) ATM vol
+    atm_vol_long=0.18,       # 长端(10Y) ATM vol，term structure向下收敛
+    skew_short=0.35,         # 短端skew强度(put wing更陡)
+    skew_long=0.10,          # 长端skew强度(更平)
+    smile_curvature=0.15,    # smile凸性(两翼上翘幅度)
+    seed=42
+):
+    """
+    构造一个虚构的implied volatility surface。
+    
+    行(index): 期限 tenor，从1M到10Y
+    列(columns): moneyness = K/S，从80%到120%
+    
+    使用简化的二次型 smile + skew 参数化：
+        vol(k, tau) = atm_vol(tau) + skew(tau) * k + curvature(tau) * k^2
+    其中 k = ln(moneyness) 是对数moneyness，
+    atm_vol(tau) 和 skew(tau) 随期限做指数插值/衰减，
+    模拟真实市场中短端更陡、长端更平的term structure特征。
+    
+    Returns
+    -------
+    pd.DataFrame，index为tenor标签，columns为moneyness标签，值为implied vol
+    """
+    np.random.seed(seed)
+
+    tenors_labels = ['1M','2M','3M','6M','9M','1Y','18M','2Y','3Y','4Y','5Y','7Y','10Y']
+    tenors_yrs    = np.array([1/12, 2/12, 3/12, 6/12, 9/12, 1, 1.5, 2, 3, 4, 5, 7, 10])
+
+    moneyness_labels = ['80%','90%','95%','97.5%','100%','102.5%','105%','110%','120%']
+    moneyness_vals    = np.array([0.80,0.90,0.95,0.975,1.00,1.025,1.05,1.10,1.20])
+    log_moneyness     = np.log(moneyness_vals)   # k = ln(K/S)
+
+    # --- term structure of ATM vol：指数衰减，从短端到长端 ---
+    decay = 0.35
+    atm_vol_term = atm_vol_long + (atm_vol_short - atm_vol_long) * np.exp(-decay * tenors_yrs)
+
+    # --- term structure of skew：短端陡、长端平 ---
+    skew_term = skew_long + (skew_short - skew_long) * np.exp(-decay * tenors_yrs)
+
+    # --- smile curvature：随期限略微衰减，但不像skew衰减那么快 ---
+    curvature_term = smile_curvature * np.exp(-0.15 * tenors_yrs)
+
+    # --- 组装 surface ---
+    surface = np.zeros((len(tenors_yrs), len(moneyness_vals)))
+    for i, tau in enumerate(tenors_yrs):
+        # 负号：put wing (低moneyness, k<0) vol更高 → skew项前面用负号乘k
+        surface[i, :] = (
+            atm_vol_term[i]
+            - skew_term[i] * log_moneyness
+            + curvature_term[i] * log_moneyness**2
+        )
+
+    # 加一点点随机noise模拟市场报价的不完美（可选，seed固定保证可复现）
+    noise = np.random.normal(0, 0.002, surface.shape)
+    surface = surface + noise
+    surface = np.clip(surface, 0.05, None)  # 防止noise把vol打到负数
+
+    df = pd.DataFrame(surface, index=tenors_labels, columns=moneyness_labels)
+    return df
+
+
+# --- 快速验证 ---
 if __name__ == "__main__":
-    surface_df = main()
+    vol_surface = generate_fake_vol_surface()
+    pd.set_option('display.float_format', lambda x: f'{x:.4f}')
+    print(vol_surface)
+
