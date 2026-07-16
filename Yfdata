@@ -427,3 +427,24 @@ JOIN sys.columns cr ON fkc.referenced_object_id = cr.object_id AND fkc.reference
 ORDER BY tp.name;
 
 
+
+SELECT 
+    s.name AS SchemaName,
+    t.name AS TableName,
+    i.name AS IndexName,
+    i.type_desc AS IndexType,           -- CLUSTERED / NONCLUSTERED / HEAP 等
+    i.is_unique AS IsUnique,
+    i.is_primary_key AS IsPrimaryKey,
+    i.is_unique_constraint AS IsUniqueConstraint,
+    c.name AS ColumnName,
+    ic.key_ordinal AS KeyOrder,          -- 列在索引中的顺序
+    ic.is_included_column AS IsIncludedColumn, -- 是否为"包含列"(非键列)
+    ic.is_descending_key AS IsDescending
+FROM sys.indexes i
+JOIN sys.tables t ON i.object_id = t.object_id
+JOIN sys.schemas s ON t.schema_id = s.schema_id
+JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id
+JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id
+WHERE i.name IS NOT NULL   -- 排除没有命名的heap
+ORDER BY s.name, t.name, i.name, ic.key_ordinal;
+
