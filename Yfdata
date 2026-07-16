@@ -448,3 +448,17 @@ JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id
 WHERE i.name IS NOT NULL   -- 排除没有命名的heap
 ORDER BY s.name, t.name, i.name, ic.key_ordinal;
 
+
+
+SELECT 
+    s.name AS SchemaName,
+    o.name AS FunctionName,
+    o.type_desc AS FunctionType,
+    o.create_date,
+    o.modify_date,
+    m.definition AS FunctionDefinition
+FROM sys.objects o
+JOIN sys.schemas s ON o.schema_id = s.schema_id
+JOIN sys.sql_modules m ON o.object_id = m.object_id
+WHERE o.type IN ('FN', 'IF', 'TF', 'FS', 'FT')
+ORDER BY s.name, o.name;
