@@ -1,0 +1,193 @@
+"""
+American Monte Carlo (回归法) 计算亚式期权暴露 —— 完整数值示例
+==============================================================
+目的：用一个极简的数值例子(N=8条路径, n=4个观察日)，逐行展示American Monte Carlo
+(AMC / regression-based exposure) 是怎么用"一次模拟 + 横截面回归"替代"嵌套模拟"的。
+
+背景：算术平均亚式看涨期权，payoff = max(算术平均价格 - K, 0)。
+要算PFE，需要知道：在未来某个时刻t_i，这个期权还值多少钱(对每条路径分别算)。
+
+暴力做法(嵌套MC)：在t_i这一点，对每条路径的状态，重新往前模拟一堆新路径去估计剩余期权价值。
+                  计算量 = N条外层路径 × T个时间点 × M条内层路径，太贵。
+
+AMC做法：只模拟一次(N条路径走到底)，利用"路径已经知道自己未来结局"这个事实，
+         把(状态 -> 未来结局)这个函数关系用回归从数据里估出来，不需要额外模拟。
+
+运行方式：python3 american_monte_carlo_toy_example.py
+"""
+
+import numpy as np
+from math import log, exp
+
+np.set_printoptions(precision=4, suppress=True)
+
+
+def section(title):
+    print("\n" + "=" * 70)
+    print(title)
+    print("=" * 70)
+
+
+# ======================================================================
+# 参数设置
+# ======================================================================
+S0, K, r, sigma = 100.0, 100.0, 0.01, 0.25   # 初始价格, 执行价, 无风险利率, 波动率
+n = 4                                          # 一共4个观察日 (比如季度观察, 1年到期)
+dt = 1.0 / n                                   # 每期时间步长
+N = 8                                          # 路径数 (刻意取小, 方便手动核对每一步)
+
+print(f"参数: S0={S0}, K={K}, r={r}, sigma={sigma}, 观察日数n={n}, 路径数N={N}")
+
+
+# ======================================================================
+# 第1步：模拟N条路径，一次性走完全程 (0 -> T)
+# ======================================================================
+section("第1步：模拟N条路径 (0 -> T 一次性生成，后面所有时间点都复用这批路径)")
+
+rng = np.random.default_rng(42)
+drift = (r - 0.5 * sigma ** 2) * dt
+vol = sigma * np.sqrt(dt)
+print(f"每期drift = {drift:.6f}   每期vol = {vol:.6f}")
+
+Z = rng.normal(size=(N, n))                    # 标准正态随机数, shape=(N, n)
+print("\n随机数矩阵 Z (每行一条路径, 每列一个观察日):")
+print(Z)
+
+logS = log(S0) + np.cumsum(drift + vol * Z, axis=1)
+S = np.exp(logS)                               # shape=(N, n): S[:, j] = 第j+1个观察日的价格
+print("\n价格路径矩阵 S:")
+print(S)
+
+
+# ======================================================================
+# 第2步：到期(T)的payoff —— 这是每条路径"已经知道的未来结局"
+# ======================================================================
+section("第2步：到期payoff (算术平均亚式期权) —— 每条路径自己已经知道的未来结局")
+
+avg_full = S.mean(axis=1)                      # 全部n个观察日的算术平均
+payoff_T = np.maximum(avg_full - K, 0.0)        # 到期payoff
+print("到期算术平均 avg_full:", avg_full)
+print("到期payoff:           ", payoff_T)
+
+disc0 = exp(-r * 1.0)                           # 从T=1贴现到0时刻
+Y0 = disc0 * payoff_T
+print(f"\n贴现因子 exp(-r*T) = {disc0:.6f}")
+print("贴现到0时刻的payoff Y0:", Y0)
+print("(Y0.mean() 就是这个期权在0时刻的朴素MC估计价格 =", round(Y0.mean(), 4), ")")
+
+
+# ======================================================================
+# 第3步：选一个暴露日期 t_i，提取每条路径在这一刻的"状态变量"
+# ======================================================================
+section("第3步：选暴露日期 t_i = k*dt (k=2, 即一半时间点)，提取状态变量")
+
+k = 2
+t_i = k * dt
+print(f"k={k} (已经过了k个观察日), t_i={t_i}")
+
+A_t = S[:, :k].mean(axis=1)                     # 运行平均: 前k个观察日已实现的算术平均
+S_t = S[:, k - 1]                               # 当前价格 (第k个观察日的价格)
+print("已实现运行平均 A_t:", A_t)
+print("当前价格 S_t:      ", S_t)
+
+# --- 亚式期权的关键代数技巧：剩余payoff可以改写成一个"调整执行价"的新亚式期权 ---
+# 完整payoff = max( (k/n)*A_t + ((n-k)/n)*剩余部分均值 - K, 0 )
+#            = ((n-k)/n) * max( 剩余部分均值 - K'_t , 0 )
+#   其中 K'_t = (n/(n-k))*K - (k/(n-k))*A_t
+Kp = (n / (n - k)) * K - (k / (n - k)) * A_t
+print(f"\n调整执行价 Kp = (n/(n-k))*K - (k/(n-k))*A_t = (4/2)*100 - (2/2)*A_t = 200 - A_t")
+print("Kp:", Kp)
+print("(注：若Kp<=0，说明这条路径运行平均已经很高，剩余期权已无期权性，")
+print(" 属于退化的深度实值情形，实际代码里要单独处理，这个小例子里先假设都>0)")
+
+x = S_t / Kp                                    # 有效moneyness：把两维状态压缩成一维
+logx = np.log(x)
+print("\nmoneyness x = S_t/Kp:", x)
+print("log(x) (回归自变量):  ", logx)
+
+
+# ======================================================================
+# 第4步：因变量 —— 同一条路径未来payoff，贴现到t_i（不需要额外模拟，直接复用第2步）
+# ======================================================================
+section("第4步：因变量 Y_i = 每条路径自己在T的payoff，贴现回t_i")
+
+disc_ti = exp(-r * (1.0 - t_i))
+print(f"disc_ti = exp(-r*(T-t_i)) = exp(-{r}*{1.0-t_i}) = {disc_ti:.6f}")
+
+Y_i = disc_ti * payoff_T                        # 注意：还是用第2步那个payoff_T，只是换了贴现日期
+print("Y_i:", Y_i)
+print("\n重点：Y_i和logx是同一批路径上的两组数字。")
+print("我们想问：logx相近的路径，它们的Y_i平均起来大概是多少？这就是条件期望E[Y|状态]。")
+
+
+# ======================================================================
+# 第5步：横截面回归 —— 用(logx, logx^2)去拟合Y_i，得到光滑的条件期望估计
+# ======================================================================
+section("第5步：最小二乘回归 (这是AMC方法的核心)")
+
+Phi = np.column_stack([np.ones(N), logx, logx ** 2])   # 基函数矩阵: [1, logx, logx^2]
+print("设计矩阵 Phi (每行 = [1, logx_j, logx_j^2]):")
+print(Phi)
+
+beta, residuals, rank, sv = np.linalg.lstsq(Phi, Y_i, rcond=None)
+print("\n回归系数 beta (解 min ||Phi*beta - Y_i||^2):", beta)
+
+V_hat = Phi @ beta                              # 每条路径在状态(S_t, A_t)下的拟合价值
+print("\n对比:")
+print("每条路径自己噪声很大的Y_i: ", Y_i)
+print("回归给出的光滑拟合V_hat:  ", V_hat)
+print("\n注：N=8条路径去拟合3个参数，样本太小，回归本身会不稳定")
+print("(可以看到V_hat里可能出现不合理的负值)。这正是为什么实际使用时N要大得多。")
+
+
+# ======================================================================
+# 第6步：用V_hat得到这一天的暴露分布 -> EE 和 PFE
+# ======================================================================
+section("第6步：从V_hat读出暴露指标 EE / PFE")
+
+V_hat_floored = np.maximum(V_hat, 0.0)          # 期权价值不能为负，兜底取0
+EE = V_hat_floored.mean()
+PFE_75 = np.quantile(V_hat_floored, 0.75)       # N=8太小，用75%分位数示意 (正常实践用95%/97.5%，需要大N)
+
+print("V_hat (floor在0以上):", V_hat_floored)
+print(f"\nEE(t_i={t_i})  = mean(V_hat)      = {EE:.4f}")
+print(f"PFE_75(t_i={t_i}) = quantile 75%(V_hat) = {PFE_75:.4f}")
+print("\n(生产环境里N通常是1万-10万条路径，这样分位数才有统计意义；")
+print(" 这里N=8只是为了让每一步的数字都能摆出来看清楚。)")
+
+
+# ======================================================================
+# 附：把N放大到5000，验证回归的核心直觉 —— "拟合值 ≈ 状态相近路径的Y_i局部平均"
+# ======================================================================
+section("附：N=5000时，验证回归拟合值 ≈ 状态相近路径的局部平均 (核心直觉的数值验证)")
+
+N_big = 5000
+rng_big = np.random.default_rng(42)
+Z_big = rng_big.normal(size=(N_big, n))
+S_big = np.exp(log(S0) + np.cumsum(drift + vol * Z_big, axis=1))
+payoff_T_big = np.maximum(S_big.mean(axis=1) - K, 0.0)
+
+
+A_t_big = S_big[:, :k].mean(axis=1)
+S_t_big = S_big[:, k - 1]
+Kp_big = (n / (n - k)) * K - (k / (n - k)) * A_t_big
+logx_big = np.log(S_t_big / Kp_big)
+Y_i_big = disc_ti * payoff_T_big
+
+Phi_big = np.column_stack([np.ones(N_big), logx_big, logx_big ** 2])
+beta_big, *_ = np.linalg.lstsq(Phi_big, Y_i_big, rcond=None)
+V_hat_big = Phi_big @ beta_big
+
+# 取logx中位数附近100条路径，比较"局部平均"与"回归拟合值"
+order = np.argsort(logx_big)
+mid_idx = order[N_big // 2 - 50: N_big // 2 + 50]
+local_avg = Y_i_big[mid_idx].mean()
+nearest_reg_val = V_hat_big[np.argsort(np.abs(logx_big - np.median(logx_big)))[0]]
+
+print(f"N={N_big}条路径, logx中位数附近100条路径:")
+print(f"  它们Y_i的局部样本均值 = {local_avg:.4f}   <- 最朴素的条件期望估计")
+print(f"  回归在同一点的拟合值 = {nearest_reg_val:.4f}   <- 应该跟局部平均接近")
+print(f"  负拟合值路径数(需floor到0) = {np.sum(V_hat_big < 0)} / {N_big}")
+
+print("\n结论：两者接近但不完全相等 —— 回归用一条全局二次曲线去平滑所有点，")
+print("而局部平均只看邻域，这个差距就是基函数灵活度带来的近似偏差(前面讨论过的问题)。")
