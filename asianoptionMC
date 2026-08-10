@@ -187,7 +187,176 @@ nearest_reg_val = V_hat_big[np.argsort(np.abs(logx_big - np.median(logx_big)))[0
 print(f"N={N_big}条路径, logx中位数附近100条路径:")
 print(f"  它们Y_i的局部样本均值 = {local_avg:.4f}   <- 最朴素的条件期望估计")
 print(f"  回归在同一点的拟合值 = {nearest_reg_val:.4f}   <- 应该跟局部平均接近")
-print(f"  负拟合值路径数(需floor到0) = {np.sum(V_hat_big < 0)} / {N_big}")
+print(f"  负拟合值路径数(需floor到0) = {np.sum(V_hat_big < 0)} / {N_big}"
+
+
+
+
+
+
+
+"""
+American Monte Carlo —— 真实规模示例 (N=1000条路径, n=252个观察日)
+======================================================================
+在教学版(N=8, n=4)基础上放大到真实规模，同时补上教学版里省略掉的、
+真实场景一定会遇到的问题：
+  1. 调整执行价Kp退化(<=0)时的深实值特殊处理
+  2. moneyness用log并做winsorize，防止基函数矩阵病态
+  3. 明确统计：一共做了多少次回归
+
+运行方式：python3 american_monte_carlo_realistic_example.py
+"""
+
+import numpy as np
+from math import log, exp
+
+
+def section(title):
+    print("\n" + "=" * 70)
+    print(title)
+    print("=" * 70)
+
+
+# ======================================================================
+# 参数设置
+# ======================================================================
+S0, K, r, sigma, T = 100.0, 100.0, 0.01, 0.25, 1.0
+n = 252                       # 252个交易日观察 (真实场景)
+dt = T / n
+N = 1000                      # 1000条路径 (真实场景常用1万-10万，这里1000方便先跑通)
+
+print(f"参数: S0={S0}, K={K}, r={r}, sigma={sigma}, T={T}")
+print(f"观察日数 n={n}, 路径数 N={N}")
+
+
+# ======================================================================
+# 第1步：一次性模拟全部N条路径，从0到T (只做这一次)
+# ======================================================================
+section("第1步：一次性模拟N条路径 (只生成这一次，后面所有暴露日期都复用)")
+
+rng = np.random.default_rng(2026)
+drift = (r - 0.5 * sigma ** 2) * dt
+vol = sigma * np.sqrt(dt)
+
+increments = drift + vol * rng.normal(size=(N, n))
+logS = log(S0) + np.cumsum(increments, axis=1)
+S = np.empty((N, n + 1))
+S[:, 0] = S0
+S[:, 1:] = np.exp(logS)
+print(f"价格矩阵 S 的形状: {S.shape}  (N条路径 x (n+1)个价格点，含t=0)")
+
+running_sum = np.cumsum(S[:, 1:], axis=1)         # running_sum[:,k-1] = 前k个观察日价格之和
+
+
+# ======================================================================
+# 第2步：到期payoff —— 每条路径已知的未来结局 (只算一次)
+# ======================================================================
+section("第2步：到期payoff (算术平均亚式看涨)")
+
+payoff_T = np.maximum(running_sum[:, -1] / n - K, 0.0)
+disc0 = exp(-r * T)
+print(f"朴素MC价格估计 (未做任何方差缩减) = {disc0 * payoff_T.mean():.4f}")
+print(f"标准误 = {disc0 * payoff_T.std(ddof=1)/np.sqrt(N):.4f}")
+
+
+# ======================================================================
+# 第3步：确定暴露日期网格 —— 决定"要做多少次回归"
+# ======================================================================
+section("第3步：确定暴露日期网格 (回归次数 = 这里选的日期个数, 与N无关)")
+
+# 每21个交易日取一个点，大约相当于每月一个暴露日 (12个月的网格)
+expo_dates_idx = list(range(21, n, 21))
+print(f"选定的暴露日期(交易日索引 k): {expo_dates_idx}")
+print(f"一共 {len(expo_dates_idx)} 个暴露日期 -> 需要做 {len(expo_dates_idx)} 次回归")
+print(f"(对比：如果要252天每天都有暴露值，就要做252次回归；")
+print(f" 对比：如果用嵌套MC暴力做，需要 N x T x M = "
+      f"{N} x {len(expo_dates_idx)} x 20000 = {N*len(expo_dates_idx)*20000:,} 次路径模拟)")
+
+
+# ======================================================================
+# 第4步：对每个暴露日期，做一次回归 —— 这是循环的核心
+# ======================================================================
+section("第4步：逐个暴露日期做回归 (循环体 = 教学版的第3~5步)")
+
+
+def basis(logx):
+    """三次多项式基函数 [1, logx, logx^2, logx^3]"""
+    return np.column_stack([logx ** p for p in range(4)])
+
+
+results = []
+regression_count = 0
+
+for k in expo_dates_idx:
+    t_i = k * dt
+
+    # --- 教学版第3步：提取状态变量 ---
+    A_t = running_sum[:, k - 1] / k              # 已实现运行平均
+    S_t = S[:, k]                                 # 当前价格
+    Kp = (n / (n - k)) * K - (k / (n - k)) * A_t   # 调整执行价
+
+    # --- 真实场景才会遇到的问题1：Kp退化(<=0)，剩余期权已无期权性 ---
+    deep_itm = Kp <= 1e-6
+    normal = ~deep_itm
+
+    disc_ti = exp(-r * (T - t_i))
+    Y_i = disc_ti * payoff_T                       # 教学版第4步：因变量(复用第2步的payoff_T)
+
+    V_hat = np.empty(N)
+
+    # 深实值路径：剩余payoff已经是确定性的，不需要回归，直接用远期价代入
+    if deep_itm.any():
+        idx = np.where(deep_itm)[0]
+        remain = n - k
+        # 剩余每日期望远期价的平均 (风险中性measure下 E[S_u]=S_t*exp(r*(u-t)))
+        avg_fwd_factor = np.mean([exp(r * (j + 1) * dt) for j in range(remain)]) if remain > 0 else 1.0
+        avg_fwd = S_t[idx] * avg_fwd_factor
+        intrinsic = (k / n) * A_t[idx] + ((n - k) / n) * avg_fwd - K
+        V_hat[idx] = disc_ti * np.maximum(intrinsic, 0.0)
+
+    # 正常路径：做回归 (教学版第5步，真实场景里加了winsorize防止病态)
+    if normal.any():
+        idx = np.where(normal)[0]
+        x = S_t[idx] / Kp[idx]
+        logx = np.log(x)
+
+        # --- 真实场景才会遇到的问题2：极端离群点让基函数矩阵病态 ---
+        lo, hi = np.quantile(logx, [0.005, 0.995])
+        logx_clipped = np.clip(logx, lo, hi)
+
+        Phi = basis(logx_clipped)
+        beta, *_ = np.linalg.lstsq(Phi, Y_i[idx], rcond=None)   # <- 这就是"一次回归"
+        regression_count += 1
+
+        V_hat[idx] = Phi @ beta
+
+    EE = np.mean(np.maximum(V_hat, 0.0))
+    PFE95 = np.quantile(V_hat, 0.95)
+    results.append((t_i, EE, PFE95, deep_itm.sum()))
+
+print(f"\n实际完成的回归次数 = {regression_count}  (等于暴露日期个数 {len(expo_dates_idx)})")
+print(f"每次回归的规模: 最多{N}个观测点 拟合4个参数 -> 极快 (相比嵌套MC每点2万次模拟)")
+
+
+# ======================================================================
+# 第5步：汇总PFE profile
+# ======================================================================
+section("第5步：PFE Profile 汇总")
+
+print(f"{'t_i':>6} {'EE':>10} {'PFE95':>10} {'深实值路径数':>10}")
+for t_i, ee, pfe, n_itm in results:
+    print(f"{t_i:6.3f} {ee:10.4f} {pfe:10.4f} {n_itm:10d}")
+
+print("\n计算量对比总结:")
+print(f"  嵌套MC暴力法: N x len(暴露日) x M(内层路径) 次模拟")
+print(f"             = {N} x {len(expo_dates_idx)} x 20000 = {N*len(expo_dates_idx)*20000:,}")
+print(f"  American MC: N x n(全路径生成一次) + len(暴露日)次回归")
+print(f"             = {N*n:,} (模拟) + {len(expo_dates_idx)}次回归 (每次O(N))")
+
+
+
+
+
 
 print("\n结论：两者接近但不完全相等 —— 回归用一条全局二次曲线去平滑所有点，")
 print("而局部平均只看邻域，这个差距就是基函数灵活度带来的近似偏差(前面讨论过的问题)。")
