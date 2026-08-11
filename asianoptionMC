@@ -360,3 +360,229 @@ print(f"             = {N*n:,} (模拟) + {len(expo_dates_idx)}次回归 (每次
 
 print("\n结论：两者接近但不完全相等 —— 回归用一条全局二次曲线去平滑所有点，")
 print("而局部平均只看邻域，这个差距就是基函数灵活度带来的近似偏差(前面讨论过的问题)。")
+
+
+
+
+
+
+
+
+
+
+
+
+"""
+三段式结构：历史分析 -> Filtered Historical Bootstrap -> AMC计算PFE
+======================================================================
+Part 1: 对3年历史时间序列做分析 (拟合GARCH(1,1), 提取条件波动率h_t和标准化残差z_t)
+Part 2: 基于Part 1的分析结果做bootstrap (Filtered Historical Simulation:
+         bootstrap标准化残差 z_t, 而不是原始收益率, 再用GARCH递推重新"注入"
+         波动率动态, 让路径继承当前的波动率regime)
+Part 3: AMC回归计算PFE (逻辑不变, 只是路径来源换了)
+
+运行方式：python3 fhs_amc_pfe.py
+"""
+
+import numpy as np
+from math import log, exp
+from scipy.optimize import minimize
+
+
+def section(title):
+    print("\n" + "=" * 70)
+    print(title)
+    print("=" * 70)
+
+
+def autocorr(x, lag=1):
+    return np.corrcoef(x[:-lag], x[lag:])[0, 1]
+
+
+# ======================================================================
+# PART 1: 历史时间序列分析
+# ======================================================================
+section("PART 1: 历史时间序列分析 —— 拟合GARCH(1,1), 提取条件波动率与标准化残差")
+
+# --- 1.0 输入数据 (占位: 合成一段带波动聚集的历史收益率序列) ---
+# 实际使用时，把这里换成你真实的3年历史价格序列，取log-return即可：
+#   hist_returns = np.diff(np.log(real_price_series))
+print("[1.0] 输入历史数据 (此处为合成占位数据，标注：实盘请替换为真实3年价格序列的log-return)")
+rng_hist = np.random.default_rng(1)
+n_hist = 756
+omega_true, alpha_true, beta_true = 1e-6, 0.08, 0.90
+h_true = np.empty(n_hist)
+h_true[0] = omega_true / (1 - alpha_true - beta_true)
+eps = rng_hist.normal(size=n_hist)
+hist_returns = np.empty(n_hist)
+hist_returns[0] = np.sqrt(h_true[0]) * eps[0]
+for t in range(1, n_hist):
+    h_true[t] = omega_true + alpha_true*hist_returns[t-1]**2 + beta_true*h_true[t-1]
+    hist_returns[t] = np.sqrt(h_true[t]) * eps[t]
+print(f"      历史序列长度: {n_hist}个交易日 (约3年)")
+print(f"      原始收益率年化波动率: {hist_returns.std()*np.sqrt(252):.4f}")
+print(f"      原始收益率 |r|^2 一阶自相关: {autocorr(hist_returns**2):.4f}  <- 波动聚集的证据")
+
+# --- 1.1 拟合GARCH(1,1): r_t = sqrt(h_t)*z_t,  h_t = omega + alpha*r_{t-1}^2 + beta*h_{t-1} ---
+print("\n[1.1] 拟合GARCH(1,1) (极大似然估计)")
+
+
+def garch_h_path(params, r):
+    omega, alpha, beta = params
+    n = len(r)
+    h = np.empty(n)
+    h[0] = np.var(r)
+    for t in range(1, n):
+        h[t] = omega + alpha*r[t-1]**2 + beta*h[t-1]
+    return h
+
+
+def garch_negloglik(params, r):
+    omega, alpha, beta = params
+    if omega <= 0 or alpha < 0 or beta < 0 or alpha + beta >= 0.999:
+        return 1e10
+    h = garch_h_path(params, r)
+    ll = -0.5 * np.sum(np.log(2*np.pi*h) + r**2/h)
+    return -ll
+
+
+x0 = [1e-6, 0.05, 0.85]
+opt = minimize(garch_negloglik, x0, args=(hist_returns,), method="Nelder-Mead",
+                options={"xatol": 1e-10, "fatol": 1e-10, "maxiter": 5000})
+omega_hat, alpha_hat, beta_hat = opt.x
+print(f"      拟合结果: omega={omega_hat:.3e}, alpha={alpha_hat:.4f}, beta={beta_hat:.4f}")
+print(f"      (真实生成参数供对照: omega={omega_true:.3e}, alpha={alpha_true:.4f}, beta={beta_true:.4f})")
+print(f"      alpha+beta = {alpha_hat+beta_hat:.4f}  (越接近1，波动率冲击的persistence越强)")
+
+# --- 1.2 提取条件波动率h_t和标准化残差z_t ---
+print("\n[1.2] 提取条件波动率路径 h_t 和标准化残差 z_t = r_t / sqrt(h_t)")
+h_hist = garch_h_path(opt.x, hist_returns)
+z_hist = hist_returns / np.sqrt(h_hist)
+
+print(f"      标准化残差 z_t (去均值前): mean={z_hist.mean():.4f}, std={z_hist.std():.4f}")
+print(f"      -> 非零均值说明历史数据里的漂移没有被GARCH的零均值假设完全吸收")
+print(f"      -> 强制去均值，保证bootstrap抽样池本身均值为0，drift完全由Part2的显式风险中性项贡献")
+z_hist_raw_mean = z_hist.mean()
+z_hist = z_hist - z_hist_raw_mean
+print(f"      标准化残差 z_t (去均值后): mean={z_hist.mean():.6f}, std={z_hist.std():.4f}  (应该接近0和1)")
+print(f"      标准化残差 z_t 的峰度(kurtosis): {((z_hist-z_hist.mean())**4).mean()/z_hist.std()**4:.4f}  "
+      f"(>3说明比正态分布更厚尾，即使经过GARCH过滤，肥尾依然存在——这正是要bootstrap而不是假设正态的原因)")
+print(f"      过滤后 z_t^2 的一阶自相关: {autocorr(z_hist**2):.4f}  "
+      f"(应该远小于原始收益率的{autocorr(hist_returns**2):.4f}，说明GARCH已经把大部分波动聚集结构显式建模掉了)")
+
+# --- 1.3 当前波动率状态 (forward模拟的起点，让未来路径继承"现在市场是平静还是剧烈") ---
+h_last = h_hist[-1]
+r_last = hist_returns[-1]
+print(f"\n[1.3] 当前(最新)条件波动率状态: h_last={h_last:.6e} "
+      f"(年化 {np.sqrt(h_last*252):.4f})，这是Part 2 forward模拟的起点")
+
+
+# ======================================================================
+# PART 2: Filtered Historical Simulation —— 基于Part 1结果做bootstrap
+# ======================================================================
+section("PART 2: 基于Part 1的分析结果做Bootstrap (Filtered Historical Simulation)")
+
+N = 1000
+n_future = 252
+r_rate = 0.01     # 风险中性利率
+S0 = 100.0
+dt = 1.0 / 252
+
+print(f"[2.1] 对标准化残差z_t做iid bootstrap重抽样 (N={N}条路径, 每条{n_future}步)")
+print("      注：因为GARCH已经把聚集结构显式建到h_t的递推方程里了，")
+print("      所以这里对残差本身iid重抽样即可 -- 聚集效应会在Part 2.2的递推中被重新生成，")
+print("      不需要再对残差做block bootstrap。")
+
+rng_boot = np.random.default_rng(2026)
+z_star = rng_boot.choice(z_hist, size=(N, n_future), replace=True)
+
+print(f"\n[2.2] 用GARCH递推 + 风险中性drift修正，把bootstrap残差转换成未来收益率路径")
+print("      递推: h_t = omega + alpha*shock_{t-1}^2 + beta*h_{t-1}")
+print("            shock_t = sqrt(h_t) * z*_t        (纯波动率驱动的shock，不含drift)")
+print("            r_t^adj = (r*dt - 0.5*h_t) + shock_t   (风险中性drift + 该期GARCH方差凸性修正)")
+
+h_path = np.empty((N, n_future))
+shock_path = np.empty((N, n_future))
+h_prev = np.full(N, h_last)
+shock_prev = np.full(N, r_last)   # 用历史最后一个实际shock做递推起点
+
+for t in range(n_future):
+    h_t = omega_hat + alpha_hat*shock_prev**2 + beta_hat*h_prev
+    shock_t = np.sqrt(h_t) * z_star[:, t]
+    h_path[:, t] = h_t
+    shock_path[:, t] = shock_t
+    h_prev = h_t
+    shock_prev = shock_t
+
+adjusted_returns = (r_rate*dt - 0.5*h_path) + shock_path
+
+print(f"\n      验证: 调整后收益率整体均值 = {adjusted_returns.mean():.6f}, "
+      f"目标风险中性日均漂移(近似) = {r_rate*dt - 0.5*h_path.mean():.6f}")
+print(f"      调整后路径波动率(年化, 横截面平均) = {np.sqrt(h_path.mean()*252):.4f} "
+      f"(应接近当前vol regime {np.sqrt(h_last*252):.4f}附近，而不是整个历史窗口的平均波动率)")
+
+# --- 2.3 生成价格路径 ---
+logS = log(S0) + np.cumsum(adjusted_returns, axis=1)
+S = np.empty((N, n_future+1))
+S[:, 0] = S0
+S[:, 1:] = np.exp(logS)
+print(f"\n[2.3] 价格路径矩阵形状: {S.shape}")
+print(f"      到期(T)价格: mean={S[:,-1].mean():.2f}, std={S[:,-1].std():.2f}")
+
+
+# ======================================================================
+# PART 3: AMC回归计算PFE (逻辑不变)
+# ======================================================================
+section("PART 3: American Monte Carlo 回归计算PFE")
+
+K, T = 100.0, 1.0
+n = n_future
+running_sum = np.cumsum(S[:, 1:], axis=1)
+payoff_T = np.maximum(running_sum[:, -1]/n - K, 0.0)
+expo_dates_idx = list(range(21, n, 21))
+
+
+def basis(logx):
+    return np.column_stack([logx**p for p in range(4)])
+
+
+results = []
+for k_idx in expo_dates_idx:
+    t_i = k_idx*dt
+    A_t = running_sum[:, k_idx-1]/k_idx
+    S_t = S[:, k_idx]
+    Kp = (n/(n-k_idx))*K - (k_idx/(n-k_idx))*A_t
+
+    deep_itm = Kp <= 1e-6
+    normal = ~deep_itm
+    disc_ti = exp(-r_rate*(T-t_i))
+    Y_i = disc_ti*payoff_T
+
+    V_hat = np.empty(N)
+    if deep_itm.any():
+        idx = np.where(deep_itm)[0]
+        remain = n - k_idx
+        avg_fwd_factor = np.mean([exp(r_rate*(j+1)*dt) for j in range(remain)]) if remain > 0 else 1.0
+        avg_fwd = S_t[idx]*avg_fwd_factor
+        intrinsic = (k_idx/n)*A_t[idx] + ((n-k_idx)/n)*avg_fwd - K
+        V_hat[idx] = disc_ti*np.maximum(intrinsic, 0.0)
+
+    if normal.any():
+        idx = np.where(normal)[0]
+        logx = np.log(S_t[idx]/Kp[idx])
+        lo, hi = np.quantile(logx, [0.005, 0.995])
+        logx_c = np.clip(logx, lo, hi)
+        Phi = basis(logx_c)
+        beta_amc, *_ = np.linalg.lstsq(Phi, Y_i[idx], rcond=None)
+        V_hat[idx] = Phi @ beta_amc
+
+    EE = np.mean(np.maximum(V_hat, 0.0))
+    PFE95 = np.quantile(V_hat, 0.95)
+    results.append((t_i, EE, PFE95))
+
+print(f"{'t_i':>6} {'EE':>10} {'PFE95':>10}")
+for t_i, ee, pfe in results:
+    print(f"{t_i:6.3f} {ee:10.4f} {pfe:10.4f}")
+
+
+
