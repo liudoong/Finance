@@ -724,3 +724,254 @@ if __name__ == "__main__":
             run_trade(spec)
         except FileNotFoundError:
             print(f"[{name}] SKIPPED — price file '{spec['price_file']}' not found.")
+
+
+
+
+
+"""
+GARCH Version — Daily MTM Matrix (1000 paths x every business day)
+=======================================================================
+Back to the GARCH-simulated paths (not block bootstrap). Simplest possible
+way to get MTM(path, day): reuse the already-validated LSM-style regression
+(no nested Monte Carlo, no importance sampling) -- just run it on EVERY
+business day instead of a weekly grid, producing a full (N_PATHS x n_days)
+matrix of Barclays-perspective MTM values.
+"""
+
+import pandas as pd
+import numpy as np
+from scipy.optimize import minimize
+
+#%% ========================================================================
+# BLOCK 0 — Trade selection
+# ===========================================================================
+
+def d(date_str):
+    return pd.Timestamp(pd.to_datetime(date_str, format="%d-%b-%y"))
+
+def dlist(s):
+    return [d(x.strip()) for x in s.split(",")]
+
+TRADES = {
+    "MU": dict(
+        ticker="MU", price_file="MU.xlsx",
+        pricing_date=d("13-Aug-26"), shares=384000,
+        KO_barrier=1.00, coupon_barrier=0.50, KI_barrier=0.50,
+        coupon_rate=0.12790500,
+        coupon_obs_dates=dlist("10-Feb-27, 11-Aug-27"),
+        coupon_pay_dates=dlist("16-Feb-27, 16-Aug-27"),
+        ko_obs_dates=dlist("10-Feb-27"),
+        ko_pay_dates=dlist("16-Feb-27"),
+        swap_obs_start=dlist("17-Aug-26, 16-Feb-27"),
+        swap_obs_end=dlist("16-Feb-27, 16-Aug-27"),
+    ),
+    "GOOGL": dict(
+        ticker="GOOGL", price_file="GOOGL.xlsx",
+        pricing_date=d("13-Aug-26"), shares=756000,
+        KO_barrier=1.00, coupon_barrier=0.6614, KI_barrier=0.6614,
+        coupon_rate=0.06418900,
+        coupon_obs_dates=dlist("10-Feb-27, 11-Aug-27, 09-Feb-28, 09-Aug-28"),
+        coupon_pay_dates=dlist("16-Feb-27, 16-Aug-27, 14-Feb-28, 14-Aug-28"),
+        ko_obs_dates=dlist("10-Feb-27, 11-Aug-27, 09-Feb-28"),
+        ko_pay_dates=dlist("16-Feb-27, 16-Aug-27, 14-Feb-28"),
+        swap_obs_start=dlist("17-Aug-26, 16-Feb-27, 16-Aug-27, 14-Feb-28"),
+        swap_obs_end=dlist("16-Feb-27, 16-Aug-27, 14-Feb-28, 14-Aug-28"),
+    ),
+    # NFLX / UNH: same pattern, add when their price files are available
+}
+
+TRADE_NAME = "MU"          # <- change and rerun
+spec = TRADES[TRADE_NAME]
+
+N_PATHS   = 1000
+RNG_SEED  = 2026
+r_rate    = 0.0362
+r_funding = 0.0362
+
+#%% ========================================================================
+# BLOCK 1 — Load prices, calibrate GARCH(1,1)
+# ===========================================================================
+
+raw = pd.read_excel(spec["price_file"], sheet_name="Sheet1")
+raw = raw[~raw["Open"].astype(str).str.contains("Dividend", case=False, na=False)]
+raw.columns = raw.columns.str.strip()
+raw = raw[["Date", "Adj Close"]].set_index("Date")
+prices = raw.sort_index().iloc[:, 0]
+S0 = prices.iloc[-1]
+
+returns = np.log(prices).diff().dropna().values
+
+def garch_h_path(params, r):
+    omega, alpha, beta = params
+    h = np.empty(len(r))
+    h[0] = np.var(r)
+    for t in range(1, len(r)):
+        h[t] = omega + alpha * r[t-1] ** 2 + beta * h[t-1]
+    return h
+
+def negloglik(params, r):
+    omega, alpha, beta = params
+    if omega <= 0 or alpha < 0 or beta < 0 or alpha + beta >= 0.999:
+        return 1e10
+    h = garch_h_path(params, r)
+    return 0.5 * np.sum(np.log(2 * np.pi * h) + r ** 2 / h)
+
+opt = minimize(negloglik, [1e-6, 0.05, 0.85], args=(returns,), method="Nelder-Mead",
+                options={"xatol": 1e-10, "fatol": 1e-10, "maxiter": 50000})
+omega_hat, alpha_hat, beta_hat = opt.x
+h = garch_h_path(opt.x, returns)
+z = returns / np.sqrt(h)
+z -= z.mean()
+h_last, r_last = h[-1], returns[-1]
+
+print(f"S0={S0:.2f}  GARCH: omega={omega_hat:.3e} alpha={alpha_hat:.4f} beta={beta_hat:.4f} "
+      f"(persistence={alpha_hat+beta_hat:.4f})")
+
+#%% ========================================================================
+# BLOCK 2 — Bootstrap GARCH paths
+# ===========================================================================
+
+start_date = spec["pricing_date"]
+end_date   = spec["coupon_obs_dates"][-1]
+n_future = np.busday_count(start_date.date(), end_date.date())
+dt = 1.0 / 252
+
+rng = np.random.default_rng(RNG_SEED)
+z_star = rng.choice(z, size=(N_PATHS, n_future), replace=True)
+
+h_path, shock_path = np.empty((N_PATHS, n_future)), np.empty((N_PATHS, n_future))
+h_prev, shock_prev = np.full(N_PATHS, h_last), np.full(N_PATHS, r_last)
+for t in range(n_future):
+    h_t = omega_hat + alpha_hat * shock_prev**2 + beta_hat * h_prev
+    shock_t = np.sqrt(h_t) * z_star[:, t]
+    h_path[:, t], shock_path[:, t] = h_t, shock_t
+    h_prev, shock_prev = h_t, shock_t
+
+adjusted_returns = (r_rate * dt - 0.5 * h_path) + shock_path
+logS = np.log(S0) + np.cumsum(adjusted_returns, axis=1)
+S = np.empty((N_PATHS, n_future + 1))
+S[:, 0], S[:, 1:] = S0, np.exp(logS)
+
+future_dates = pd.bdate_range(start=start_date, end=end_date)[1:]
+assert len(future_dates) == n_future
+all_dates = pd.DatetimeIndex([start_date]).append(future_dates)
+
+S_df = pd.DataFrame(S, columns=all_dates)
+S_df.index.name = "path"
+available_dates = S_df.columns
+print(f"Simulated {N_PATHS} paths x {n_future} business days.")
+
+#%% ========================================================================
+# BLOCK 3 — Realized cash flows per path (N-period KO/Coupon/KI tree)
+# ===========================================================================
+
+shares      = spec["shares"]
+Notional    = shares * S0
+coupon_rate = spec["coupon_rate"]
+KO_level    = spec["KO_barrier"] * S0
+Cpn_level   = spec["coupon_barrier"] * S0
+KI_level    = spec["KI_barrier"] * S0
+
+ko_obs, ko_pay   = spec["ko_obs_dates"], spec["ko_pay_dates"]
+cpn_obs, cpn_pay = spec["coupon_obs_dates"], spec["coupon_pay_dates"]
+sw_start, sw_end = spec["swap_obs_start"], spec["swap_obs_end"]
+
+n_ko_periods = len(ko_obs)
+n_periods    = len(cpn_obs)
+tau = [(sw_end[k] - sw_start[k]).days / 360 for k in range(n_periods)]
+
+events = [[] for _ in range(N_PATHS)]
+ko_period_idx = np.full(N_PATHS, -1, dtype=int)
+
+for i in range(N_PATHS):
+    resolved = False
+    for k in range(n_ko_periods):
+        S_k = S_df[ko_obs[k]].values[i]
+        funding_k = Notional * r_funding * tau[k]
+        coupon_k  = Notional * coupon_rate if S_k >= Cpn_level else 0.0
+        if S_k >= KO_level:
+            events[i].append((ko_pay[k], funding_k - (coupon_k + Notional)))
+            ko_period_idx[i] = k
+            resolved = True
+            break
+        else:
+            events[i].append((cpn_pay[k], funding_k - coupon_k))
+    if not resolved:
+        k = n_periods - 1
+        S_final   = S_df[cpn_obs[k]].values[i]
+        funding_k = Notional * r_funding * tau[k]
+        if S_final < KI_level:
+            coupon_k, principal_k = 0.0, Notional * (S_final / S0)
+        else:
+            coupon_k = Notional * coupon_rate if S_final >= Cpn_level else 0.0
+            principal_k = Notional
+        events[i].append((cpn_pay[k], funding_k - (coupon_k + principal_k)))
+
+print(f"Notional=${Notional:,.0f}   KO ratio={100*(ko_period_idx>=0).mean():.1f}%")
+
+#%% ========================================================================
+# BLOCK 4 — Regression valuation function (simplest unbiased method: LSM)
+# ===========================================================================
+
+def year_frac(d1, d2):
+    return (d2 - d1).days / 365.0
+
+def pv_at(amount, valuation_date, payment_date, r=r_funding):
+    return amount * np.exp(-r * year_frac(valuation_date, payment_date))
+
+def compute_V_hat(t):
+    S_t = S_df[t].values
+    V = np.zeros(N_PATHS)
+
+    known_t = np.zeros(N_PATHS, dtype=bool)
+    for k in range(n_ko_periods):
+        known_t |= (ko_period_idx == k) & (ko_obs[k] <= t)
+
+    for i in np.where(known_t)[0]:
+        V[i] = sum(pv_at(amt, t, pay) for pay, amt in events[i] if pay > t)
+
+    unresolved = np.where(~known_t)[0]
+    if len(unresolved) > 0:
+        Y = np.array([sum(pv_at(amt, t, pay) for pay, amt in events[i] if pay > t)
+                       for i in unresolved])
+        m = S_t[unresolved] / S0
+        X = np.column_stack([np.ones_like(m), m, m**2,
+                              np.maximum(m - spec["KO_barrier"], 0),
+                              np.maximum(spec["KI_barrier"] - m, 0)])
+        beta, *_ = np.linalg.lstsq(X, Y, rcond=None)
+        V[unresolved] = X @ beta
+
+    return V
+
+#%% ========================================================================
+# BLOCK 5 — Daily MTM matrix: 1000 paths x EVERY business day (not weekly)
+# ===========================================================================
+
+mtm_matrix = np.empty((N_PATHS, len(available_dates)))
+for j, t in enumerate(available_dates):
+    mtm_matrix[:, j] = compute_V_hat(t)
+
+mtm_df = pd.DataFrame(mtm_matrix, columns=available_dates)
+mtm_df.index.name = "path"
+
+print(f"MTM matrix shape: {mtm_df.shape}  (paths x days)")
+print(mtm_df.iloc[:5, [0, 1, 2, -1]])
+
+mtm_df.to_csv(f"{TRADE_NAME}_daily_mtm_matrix.csv")
+print(f"Saved {TRADE_NAME}_daily_mtm_matrix.csv")
+
+#%% ========================================================================
+# BLOCK 6 — 10-business-day difference matrix: diff(MTM, -10) along the
+#           date axis (axis=1, since rows=paths, cols=dates). Same path,
+#           today's MTM minus its own value 10 business days earlier.
+#           First 10 columns are NaN (not enough history yet).
+# ===========================================================================
+
+diff10_df = mtm_df.diff(periods=10, axis=1)
+
+print(f"diff10_df shape: {diff10_df.shape}")
+print(diff10_df.iloc[:5, 8:14])
+
+diff10_df.to_csv(f"{TRADE_NAME}_daily_mtm_diff10.csv")
+print(f"Saved {TRADE_NAME}_daily_mtm_diff10.csv")
