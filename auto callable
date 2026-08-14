@@ -729,6 +729,12 @@ if __name__ == "__main__":
 
 
 
+
+
+
+
+
+
 """
 GARCH Version — Daily MTM Matrix (1000 paths x every business day)
 =======================================================================
@@ -958,9 +964,6 @@ mtm_df.index.name = "path"
 print(f"MTM matrix shape: {mtm_df.shape}  (paths x days)")
 print(mtm_df.iloc[:5, [0, 1, 2, -1]])
 
-mtm_df.to_csv(f"{TRADE_NAME}_daily_mtm_matrix.csv")
-print(f"Saved {TRADE_NAME}_daily_mtm_matrix.csv")
-
 #%% ========================================================================
 # BLOCK 6 — 10-business-day difference matrix: diff(MTM, -10) along the
 #           date axis (axis=1, since rows=paths, cols=dates). Same path,
@@ -973,5 +976,68 @@ diff10_df = mtm_df.diff(periods=10, axis=1)
 print(f"diff10_df shape: {diff10_df.shape}")
 print(diff10_df.iloc[:5, 8:14])
 
-diff10_df.to_csv(f"{TRADE_NAME}_daily_mtm_diff10.csv")
-print(f"Saved {TRADE_NAME}_daily_mtm_diff10.csv")
+#%% ========================================================================
+# BLOCK 6b — Exclude, per 10-day window, paths that had a KO observation or
+#            KO/final payment fall inside that specific (t-10bd, t] window
+#            (a real contractual settlement clearing shouldn't be counted
+#            as a market-risk-driven MTM swing for that window)
+# ===========================================================================
+
+final_obs, final_pay = cpn_obs[-1], cpn_pay[-1]
+
+for t in diff10_df.columns:
+    idx = available_dates.get_loc(t)
+    if idx < 10:
+        continue
+    t_minus = available_dates[idx - 10]
+
+    exclude_mask = np.zeros(N_PATHS, dtype=bool)
+    for k in range(n_ko_periods):
+        if (t_minus < ko_obs[k] <= t) or (t_minus < ko_pay[k] <= t):
+            exclude_mask |= (ko_period_idx == k)
+    if (t_minus < final_obs <= t) or (t_minus < final_pay <= t):
+        exclude_mask |= (ko_period_idx == -1)
+
+    diff10_df.loc[exclude_mask, t] = np.nan
+
+print(f"KO窗口剔除完成，剔除后 diff10_df 非NaN数量: {diff10_df.notna().sum().sum()}")
+
+#%% ========================================================================
+# BLOCK 7 — EE and PFE (99th percentile) from the 10-day diff, plot
+#
+#   E(path, day) = max(diff10(path, day), 0)  -> only the upside direction
+#   EE(day)      = mean across paths
+#   PFE_99(day)  = 99th percentile across paths
+# ===========================================================================
+
+E_df = diff10_df.clip(lower=0)
+
+EE  = E_df.mean(axis=0)
+PFE = E_df.quantile(0.99, axis=0)
+
+EE, PFE = EE.dropna(), PFE.dropna()
+
+print("EE (前15个非NaN值):")
+print(EE.head(15))
+print()
+print("PFE 99% (前15个非NaN值):")
+print(PFE.head(15))
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+
+fig, ax = plt.subplots(figsize=(12, 6))
+ax.plot(PFE.index, PFE.values, color="#1f77b4", linewidth=1.5, label="PFE 99% (10bd MPOR)")
+ax.plot(EE.index, EE.values, color="gray", linewidth=1.2, linestyle="--", label="EE (10bd MPOR)")
+ax.set_title(f"{TRADE_NAME} Autocallable — EE & PFE 99% (10-business-day MPOR, daily)")
+ax.set_ylabel("USD")
+ax.legend()
+ax.grid(alpha=0.3)
+ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"${x/1e6:.1f}M"))
+ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
+fig.autofmt_xdate()
+plt.tight_layout()
+plt.savefig(f"{TRADE_NAME}_ee_pfe_mpor_daily_chart.png", dpi=150)
+print(f"Saved {TRADE_NAME}_ee_pfe_mpor_daily_chart.png")
