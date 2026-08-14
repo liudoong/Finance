@@ -1,0 +1,317 @@
+"""
+MU Single-Stock Autocallable (Swap-Funded) — CCR PFE Model
+============================================================
+Barclays is the SELLER of the autocallable structure:
+  - Barclays PAYS the equity leg  (coupon / KO redemption / KI-adjusted redemption)
+  - Barclays RECEIVES the funding leg (SOFR-compound-linked interest on notional)
+
+Term sheet summary:
+  KO barrier      : 100% of Strike, observed once on 2027-02-10
+  Coupon barrier  : 50% of Strike, observed on 2027-02-10 and 2027-08-11
+  KI barrier      : 50% of Strike, European (observed only at maturity, 2027-08-11)
+  Memory          : False (missed coupons are not made up later)
+  Notional        : 384,000 shares (converted to USD notional using S0)
+
+Methodology:
+  1. Calibrate a GARCH(1,1) to MU log-returns; bootstrap standardized residuals
+     to simulate 1,000 risk-neutral price paths from pricing date to the final
+     observation date (2027-08-11).
+  2. For each path, compute the REALIZED net cash flows (Barclays' perspective)
+     under the KO / Coupon / KI decision tree -> this is the "ground truth"
+     used as the regression target (Y) at every future valuation date.
+  3. At each valuation date t, run a cross-sectional regression of discounted
+     realized value (from step 2) on the path's price at t (moneyness basis
+     functions) to obtain an unbiased estimate of the CONDITIONAL EXPECTED
+     value V_hat(t) -- this avoids look-ahead bias (Longstaff-Schwartz style).
+  4. Base PFE(t)      = 99th percentile of max(V_hat(t), 0)
+     PFE with 10-day MPOR(t) = 99th percentile of
+         max( max(V_hat(t),0) - max(V_hat(t-10bd),0), 0 )
+     (NOT a raw difference of V -- see write-up: differencing raw V lets
+      deeply-negative excursions register as fake positive exposure.)
+"""
+
+import pandas as pd
+import numpy as np
+from scipy.optimize import minimize
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+
+#%% ---------------------------------------------------------------------
+# 0. Term sheet parameters
+# -------------------------------------------------------------------------
+
+start_date = pd.Timestamp("2026-08-13")     # Pricing / Strike date
+end_date   = pd.Timestamp("2027-08-11")     # Final observation date (NOT the 08-16 payment date)
+
+shares       = 384000                        # term sheet "Size" is share count, not USD notional
+coupon_rate  = 0.12790500                    # same rate assumed for both coupon periods (confirmed with desk)
+
+KO_obs_date    = pd.Timestamp("2027-02-10")
+KO_pay_date    = pd.Timestamp("2027-02-16")
+Final_obs_date = pd.Timestamp("2027-08-11")
+Final_pay_date = pd.Timestamp("2027-08-16")
+
+fund1_start, fund1_end = pd.Timestamp("2026-08-17"), pd.Timestamp("2027-02-16")
+fund2_start, fund2_end = pd.Timestamp("2027-02-16"), pd.Timestamp("2027-08-16")
+tau1 = (fund1_end - fund1_start).days / 360   # ACT/360 for funding leg accrual
+tau2 = (fund2_end - fund2_start).days / 360
+
+r_rate         = 0.0362                       # risk-neutral drift AND discount rate (kept consistent)
+r_rate_funding = 0.0362                       # SOFR-compound proxy (simplification -- see caveats)
+
+N_PATHS   = 1000
+MPOR_DAYS = 10
+PFE_PCTL  = 99
+
+#%% ---------------------------------------------------------------------
+# 1. Load underlying price history
+# -------------------------------------------------------------------------
+
+df = pd.read_excel('MU.xlsx', sheet_name='Sheet1')
+df = df[~df['Open'].astype(str).str.contains('Dividend', case=False, na=False)]
+df.columns = df.columns.str.strip()
+df = df[['Date', 'Adj Close']].set_index('Date')
+
+prices  = df.sort_index().iloc[:, 0]
+returns = np.log(prices).diff().dropna().values
+S0      = prices.iloc[-1]
+
+Notional     = shares * S0                   # USD notional = shares x Strike price
+KO_level     = 1.00 * S0
+Coupon_level = 0.50 * S0
+KI_level     = 0.50 * S0
+
+#%% ---------------------------------------------------------------------
+# 2. GARCH(1,1) calibration (Nelder-Mead MLE)
+# -------------------------------------------------------------------------
+
+def garch_h_path(params, r):
+    omega, alpha, beta = params
+    h = np.empty(len(r))
+    h[0] = np.var(r)
+    for t in range(1, len(r)):
+        h[t] = omega + alpha * r[t-1] ** 2 + beta * h[t-1]
+    return h
+
+def negloglik(params, r):
+    omega, alpha, beta = params
+    if omega <= 0 or alpha < 0 or beta < 0 or alpha + beta >= 0.999:
+        return 1e10
+    h = garch_h_path(params, r)
+    return 0.5 * np.sum(np.log(2 * np.pi * h) + r ** 2 / h)
+
+x0  = [1e-6, 0.05, 0.85]
+opt = minimize(negloglik, x0, args=(returns,), method="Nelder-Mead",
+                options={"xatol": 1e-10, "fatol": 1e-10, "maxiter": 50000})
+omega_hat, alpha_hat, beta_hat = opt.x
+
+h = garch_h_path(opt.x, returns)
+z = returns / np.sqrt(h)
+z -= z.mean()
+
+h_last, r_last = h[-1], returns[-1]
+
+print(f"GARCH(1,1): omega={omega_hat:.3e}  alpha={alpha_hat:.4f}  beta={beta_hat:.4f}  "
+      f"(persistence alpha+beta={alpha_hat+beta_hat:.4f})")
+
+#%% ---------------------------------------------------------------------
+# 3. Bootstrap Monte Carlo price paths (risk-neutral)
+# -------------------------------------------------------------------------
+
+n_future = np.busday_count(start_date.date(), end_date.date())
+dt = 1.0 / 252
+
+rng_boot = np.random.default_rng(2026)
+z_star   = rng_boot.choice(z, size=(N_PATHS, n_future), replace=True)
+
+h_path, shock_path = np.empty((N_PATHS, n_future)), np.empty((N_PATHS, n_future))
+h_prev, shock_prev  = np.full(N_PATHS, h_last), np.full(N_PATHS, r_last)
+
+for t in range(n_future):
+    h_t = omega_hat + alpha_hat * shock_prev**2 + beta_hat * h_prev
+    shock_t = np.sqrt(h_t) * z_star[:, t]
+    h_path[:, t], shock_path[:, t] = h_t, shock_t
+    h_prev, shock_prev = h_t, shock_t
+
+adjusted_returns = (r_rate * dt - 0.5 * h_path) + shock_path
+logS = np.log(S0) + np.cumsum(adjusted_returns, axis=1)
+
+S = np.empty((N_PATHS, n_future + 1))
+S[:, 0], S[:, 1:] = S0, np.exp(logS)
+
+future_dates = pd.bdate_range(start=start_date, end=end_date)[1:]
+assert len(future_dates) == n_future
+all_dates = pd.DatetimeIndex([start_date]).append(future_dates)
+
+S_df = pd.DataFrame(S, columns=all_dates)
+S_df.index.name = "path"
+available_dates = S_df.columns
+
+print(f"Simulated {N_PATHS} paths x {n_future} business days.  S0 = {S0:.2f}")
+
+#%% ---------------------------------------------------------------------
+# 4. Realized cash flows per path (KO / Coupon / KI decision tree)
+# -------------------------------------------------------------------------
+
+S_KO, S_final = S_df[KO_obs_date].values, S_df[Final_obs_date].values
+ko_triggered  = S_KO >= KO_level
+
+net1_arr = np.empty(N_PATHS)
+net2_arr = np.full(N_PATHS, np.nan)
+
+for i in range(N_PATHS):
+    funding1     = Notional * r_rate_funding * tau1
+    coupon1_paid = S_KO[i] >= Coupon_level
+    coupon1      = Notional * coupon_rate if coupon1_paid else 0.0
+
+    if ko_triggered[i]:
+        net1_arr[i] = funding1 - (coupon1 + Notional)     # KO: pay coupon + full redemption, deal ends
+        continue
+
+    net1_arr[i] = funding1 - coupon1                       # no KO: pay coupon only (if triggered), keep going
+
+    funding2     = Notional * r_rate_funding * tau2
+    ki_triggered = S_final[i] < KI_level
+    if ki_triggered:
+        coupon2, principal2 = 0.0, Notional * (S_final[i] / S0)
+    else:
+        coupon2, principal2 = Notional * coupon_rate, Notional
+    net2_arr[i] = funding2 - (coupon2 + principal2)
+
+print(f"KO ratio: {ko_triggered.mean():.2%}   "
+      f"KI ratio among survivors: {(S_final[~ko_triggered] < KI_level).mean():.2%}")
+
+#%% ---------------------------------------------------------------------
+# 5. Cross-sectional regression -> conditional expected value V_hat(t)
+#    (Longstaff-Schwartz style: regress realized discounted CF on today's
+#     moneyness to get an unbiased conditional expectation, no look-ahead)
+# -------------------------------------------------------------------------
+
+def year_frac(d1, d2):
+    return (d2 - d1).days / 365.0
+
+def pv_at(amount, valuation_date, payment_date, r=r_rate_funding):
+    return amount * np.exp(-r * year_frac(valuation_date, payment_date))
+
+def basis_matrix(Sv):
+    # Moneyness-based basis (S/S0) -- keeps regression well-conditioned;
+    # hinge terms at KO (m=1) and KI (m=0.5) help capture barrier curvature.
+    m = Sv / S0
+    return np.column_stack([np.ones_like(m), m, m**2,
+                             np.maximum(m - 1.0, 0),
+                             np.maximum(0.5 - m, 0)])
+
+def compute_V_hat(t):
+    """Barclays-perspective conditional expected value at date t for all paths."""
+    S_t = S_df[t].values
+    V = np.zeros(N_PATHS)
+
+    if t < KO_obs_date:
+        Y = np.empty(N_PATHS)
+        for i in range(N_PATHS):
+            pv1 = pv_at(net1_arr[i], t, KO_pay_date)
+            Y[i] = pv1 if ko_triggered[i] else pv1 + pv_at(net2_arr[i], t, Final_pay_date)
+        X = basis_matrix(S_t)
+        beta, *_ = np.linalg.lstsq(X, Y, rcond=None)
+        V = X @ beta
+
+    elif t < KO_pay_date:
+        alive = ~ko_triggered
+        V[ko_triggered] = np.array([pv_at(net1_arr[i], t, KO_pay_date) for i in np.where(ko_triggered)[0]])
+        Y_alive = np.array([pv_at(net2_arr[i], t, Final_pay_date) for i in np.where(alive)[0]])
+        X_alive = basis_matrix(S_t[alive])
+        beta, *_ = np.linalg.lstsq(X_alive, Y_alive, rcond=None)
+        V[alive] = X_alive @ beta
+
+    elif t < Final_pay_date:
+        alive = ~ko_triggered
+        Y_alive = np.array([pv_at(net2_arr[i], t, Final_pay_date) for i in np.where(alive)[0]])
+        X_alive = basis_matrix(S_t[alive])
+        beta, *_ = np.linalg.lstsq(X_alive, Y_alive, rcond=None)
+        V[alive] = X_alive @ beta
+
+    # else: t >= Final_pay_date -> everything settled, V stays 0
+
+    return V
+
+#%% ---------------------------------------------------------------------
+# 6. Weekly valuation grid (KO / Final observation dates forced in)
+# -------------------------------------------------------------------------
+
+def snap_to_available(d):
+    if d in available_dates:
+        return d
+    idx = available_dates.get_indexer([d], method="nearest")[0]
+    return available_dates[idx]
+
+weekly_grid = pd.date_range(start=start_date, end=Final_obs_date, freq="7D")
+grid_dates  = sorted(set(snap_to_available(d) for d in weekly_grid) | {KO_obs_date, Final_obs_date})
+
+#%% ---------------------------------------------------------------------
+# 7. Base PFE profile (point-in-time, no MPOR)
+# -------------------------------------------------------------------------
+
+pfe_rows = []
+for t in grid_dates:
+    E_t = np.maximum(compute_V_hat(t), 0)
+    pfe_rows.append({"date": t,
+                      f"PFE_{PFE_PCTL}": np.percentile(E_t, PFE_PCTL),
+                      "EE": E_t.mean()})
+pfe_df = pd.DataFrame(pfe_rows).set_index("date")
+
+#%% ---------------------------------------------------------------------
+# 8. PFE with 10-business-day Margin Period of Risk
+#    E_mpor(t) = max( E(t) - E(t-10bd), 0 )   -- NOT a raw V(t)-V(t-10bd) diff.
+#    Raw-V differencing lets deeply-negative V "recover" toward zero register
+#    as a fake positive exposure jump; flooring each side first fixes this.
+# -------------------------------------------------------------------------
+
+def shift_business_days(t, ndays):
+    idx = available_dates.get_loc(t)
+    return available_dates[max(idx - ndays, 0)]
+
+mpor_rows = []
+for t in grid_dates:
+    t_minus = shift_business_days(t, MPOR_DAYS)
+    if t_minus == t:
+        continue
+    E_t       = np.maximum(compute_V_hat(t), 0)
+    E_t_minus = np.maximum(compute_V_hat(t_minus), 0)
+    E_mpor    = np.maximum(E_t - E_t_minus, 0)
+    mpor_rows.append({"date": t, "t_minus_10bd": t_minus,
+                       f"PFE_MPOR_{PFE_PCTL}": np.percentile(E_mpor, PFE_PCTL)})
+pfe_mpor_df = pd.DataFrame(mpor_rows).set_index("date")
+
+#%% ---------------------------------------------------------------------
+# 9. Output
+# -------------------------------------------------------------------------
+
+pfe_df.to_csv("pfe_df.csv")
+pfe_mpor_df.to_csv("pfe_mpor_df.csv")
+
+print("\n=== Base PFE (point-in-time) ===")
+print(pfe_df)
+print("\n=== PFE with 10-business-day MPOR ===")
+print(pfe_mpor_df)
+
+fig, ax = plt.subplots(figsize=(12, 6))
+ax.plot(pfe_df.index, pfe_df[f"PFE_{PFE_PCTL}"], color="#B22222", linewidth=2,
+        label=f"PFE {PFE_PCTL}% (no MPOR, point-in-time)")
+ax.plot(pfe_mpor_df.index, pfe_mpor_df[f"PFE_MPOR_{PFE_PCTL}"], color="#1f77b4", linewidth=2,
+        label=f"PFE {PFE_PCTL}% (10-business-day MPOR)")
+ax.plot(pfe_df.index, pfe_df["EE"], color="gray", linewidth=1.2, linestyle="--", label="EE (Expected Exposure)")
+for d, lbl in [(KO_obs_date, "KO obs"), (Final_obs_date, "Final obs")]:
+    ax.axvline(d, color="gray", linestyle=":", linewidth=1)
+    ax.text(d, ax.get_ylim()[1], f" {lbl} ({d.date()})", rotation=90, va="top", fontsize=8, color="gray")
+ax.set_title("MU Autocallable — CCR Exposure Profile (Barclays as Seller)")
+ax.set_ylabel("USD")
+ax.legend()
+ax.grid(alpha=0.3)
+ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"${x/1e6:.1f}M"))
+ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
+fig.autofmt_xdate()
+plt.tight_layout()
+plt.savefig("/mnt/user-data/outputs/MU_Autocallable_PFE_chart.png", dpi=150)
+print("\nChart saved.")
