@@ -315,3 +315,412 @@ fig.autofmt_xdate()
 plt.tight_layout()
 plt.savefig("/mnt/user-data/outputs/MU_Autocallable_PFE_chart.png", dpi=150)
 print("\nChart saved.")
+
+
+
+
+
+
+
+
+
+
+
+
+
+"""
+Parametrized Autocallable (Swap-Funded) CCR PFE Engine
+=========================================================
+Generalizes the MU single-period model to an arbitrary number of KO /
+coupon observation periods, driven entirely by a `trade_spec` dict.
+Barclays is assumed to be the SELLER (pays equity leg, receives funding leg)
+for every trade, per desk confirmation.
+
+Usage:
+    spec = TRADES["MU"]
+    pfe_df, pfe_mpor_df = run_trade(spec, price_file="MU.xlsx")
+"""
+
+import pandas as pd
+import numpy as np
+from scipy.optimize import minimize
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+
+N_PATHS   = 1000
+MPOR_DAYS = 10
+PFE_PCTL  = 99
+RNG_SEED  = 2026
+
+#%% ---------------------------------------------------------------------
+# 0. Trade specifications (parsed from term sheet image)
+#    All dates as "DD-Mon-YY". KOBarrier=1.0 for all four (no step-down).
+#    CouponBarrier == KIBarrier numerically for all four trades, but kept
+#    as separate parameters since they govern different mechanics
+#    (coupon eligibility vs. principal redemption at maturity).
+# -------------------------------------------------------------------------
+
+def d(date_str):
+    return pd.Timestamp(pd.to_datetime(date_str, format="%d-%b-%y"))
+
+def dlist(s):
+    return [d(x.strip()) for x in s.split(",")]
+
+TRADES = {
+
+    "MU": dict(
+        ticker="MU", price_file="MU.xlsx",
+        pricing_date=d("13-Aug-26"), shares=384000,
+        KO_barrier=1.00, coupon_barrier=0.50, KI_barrier=0.50,
+        coupon_rate=0.12790500,
+        coupon_obs_dates=dlist("10-Feb-27, 11-Aug-27"),
+        coupon_pay_dates=dlist("16-Feb-27, 16-Aug-27"),
+        ko_obs_dates=dlist("10-Feb-27"),
+        ko_pay_dates=dlist("16-Feb-27"),
+        swap_pay_dates=dlist("16-Feb-27, 16-Aug-27"),
+        swap_obs_start=dlist("17-Aug-26, 16-Feb-27"),
+        swap_obs_end=dlist("16-Feb-27, 16-Aug-27"),
+    ),
+
+    "NFLX": dict(
+        ticker="NFLX", price_file="NFLX.xlsx",
+        pricing_date=d("13-Aug-26"), shares=756000,
+        KO_barrier=1.00, coupon_barrier=0.6384, KI_barrier=0.6384,
+        coupon_rate=0.07436900,
+        coupon_obs_dates=dlist("10-Feb-27, 11-Aug-27, 09-Feb-28"),
+        coupon_pay_dates=dlist("16-Feb-27, 16-Aug-27, 14-Feb-28"),
+        ko_obs_dates=dlist("10-Feb-27, 11-Aug-27"),
+        ko_pay_dates=dlist("16-Feb-27, 16-Aug-27"),
+        swap_pay_dates=dlist("16-Feb-27, 16-Aug-27, 14-Feb-28"),
+        swap_obs_start=dlist("17-Aug-26, 16-Feb-27, 16-Aug-27"),
+        swap_obs_end=dlist("16-Feb-27, 16-Aug-27, 14-Feb-28"),
+    ),
+
+    "GOOGL": dict(
+        ticker="GOOGL", price_file="GOOGL.xlsx",
+        pricing_date=d("13-Aug-26"), shares=756000,
+        KO_barrier=1.00, coupon_barrier=0.6614, KI_barrier=0.6614,
+        coupon_rate=0.06418900,
+        coupon_obs_dates=dlist("10-Feb-27, 11-Aug-27, 09-Feb-28, 09-Aug-28"),
+        coupon_pay_dates=dlist("16-Feb-27, 16-Aug-27, 14-Feb-28, 14-Aug-28"),
+        ko_obs_dates=dlist("10-Feb-27, 11-Aug-27, 09-Feb-28"),
+        ko_pay_dates=dlist("16-Feb-27, 16-Aug-27, 14-Feb-28"),
+        swap_pay_dates=dlist("16-Feb-27, 16-Aug-27, 14-Feb-28, 14-Aug-28"),
+        swap_obs_start=dlist("17-Aug-26, 16-Feb-27, 16-Aug-27, 14-Feb-28"),
+        swap_obs_end=dlist("16-Feb-27, 16-Aug-27, 14-Feb-28, 14-Aug-28"),
+    ),
+
+    "UNH": dict(
+        ticker="UNH", price_file="UNH.xlsx",
+        pricing_date=d("13-Aug-26"), shares=756000,
+        KO_barrier=1.00, coupon_barrier=0.644, KI_barrier=0.644,
+        coupon_rate=0.06306500,
+        coupon_obs_dates=dlist("10-Feb-27, 11-Aug-27, 09-Feb-28, 09-Aug-28, 14-Feb-29"),
+        coupon_pay_dates=dlist("16-Feb-27, 16-Aug-27, 14-Feb-28, 14-Aug-28, 20-Feb-29"),
+        ko_obs_dates=dlist("10-Feb-27, 11-Aug-27, 09-Feb-28, 09-Aug-28"),
+        ko_pay_dates=dlist("16-Feb-27, 16-Aug-27, 14-Feb-28, 14-Aug-28"),
+        swap_pay_dates=dlist("16-Feb-27, 16-Aug-27, 14-Feb-28, 14-Aug-28, 20-Feb-29"),
+        swap_obs_start=dlist("17-Aug-26, 16-Feb-27, 16-Aug-27, 14-Feb-28, 14-Aug-28"),
+        swap_obs_end=dlist("16-Feb-27, 16-Aug-27, 14-Feb-28, 14-Aug-28, 20-Feb-29"),
+    ),
+}
+
+# Common (non-trade-specific) parameters, applied to every trade unless overridden
+COMMON = dict(
+    r_rate=0.0362,           # risk-neutral drift & discount rate
+    r_rate_funding=0.0362,   # SOFR-compound proxy (simplification)
+)
+
+#%% ---------------------------------------------------------------------
+# 1. GARCH(1,1) calibration + bootstrap MC (generic, per underlying)
+# -------------------------------------------------------------------------
+
+def garch_h_path(params, r):
+    omega, alpha, beta = params
+    h = np.empty(len(r))
+    h[0] = np.var(r)
+    for t in range(1, len(r)):
+        h[t] = omega + alpha * r[t-1] ** 2 + beta * h[t-1]
+    return h
+
+def negloglik(params, r):
+    omega, alpha, beta = params
+    if omega <= 0 or alpha < 0 or beta < 0 or alpha + beta >= 0.999:
+        return 1e10
+    h = garch_h_path(params, r)
+    return 0.5 * np.sum(np.log(2 * np.pi * h) + r ** 2 / h)
+
+def calibrate_garch(returns):
+    x0 = [1e-6, 0.05, 0.85]
+    opt = minimize(negloglik, x0, args=(returns,), method="Nelder-Mead",
+                    options={"xatol": 1e-10, "fatol": 1e-10, "maxiter": 50000})
+    omega_hat, alpha_hat, beta_hat = opt.x
+    h = garch_h_path(opt.x, returns)
+    z = returns / np.sqrt(h)
+    z -= z.mean()
+    return omega_hat, alpha_hat, beta_hat, h[-1], returns[-1], z
+
+def simulate_paths(S0, start_date, end_date, omega, alpha, beta, h_last, r_last, z,
+                    r_rate, n_paths=N_PATHS, seed=RNG_SEED):
+    n_future = np.busday_count(start_date.date(), end_date.date())
+    dt = 1.0 / 252
+    rng = np.random.default_rng(seed)
+    z_star = rng.choice(z, size=(n_paths, n_future), replace=True)
+
+    h_path, shock_path = np.empty((n_paths, n_future)), np.empty((n_paths, n_future))
+    h_prev, shock_prev = np.full(n_paths, h_last), np.full(n_paths, r_last)
+    for t in range(n_future):
+        h_t = omega + alpha * shock_prev**2 + beta * h_prev
+        shock_t = np.sqrt(h_t) * z_star[:, t]
+        h_path[:, t], shock_path[:, t] = h_t, shock_t
+        h_prev, shock_prev = h_t, shock_t
+
+    adjusted_returns = (r_rate * dt - 0.5 * h_path) + shock_path
+    logS = np.log(S0) + np.cumsum(adjusted_returns, axis=1)
+    S = np.empty((n_paths, n_future + 1))
+    S[:, 0], S[:, 1:] = S0, np.exp(logS)
+
+    future_dates = pd.bdate_range(start=start_date, end=end_date)[1:]
+    assert len(future_dates) == n_future
+    all_dates = pd.DatetimeIndex([start_date]).append(future_dates)
+
+    S_df = pd.DataFrame(S, columns=all_dates)
+    S_df.index.name = "path"
+    return S_df
+
+#%% ---------------------------------------------------------------------
+# 2. Realized cash-flow generator (N-period KO/Coupon/KI decision tree)
+# -------------------------------------------------------------------------
+
+def realized_cashflows(spec, S_df, S0):
+    """
+    For each path, walk through ko_obs_dates in order; on trigger, redeem
+    (coupon + full notional) and stop. If never triggered, at the final
+    coupon obs date (= maturity) apply the European KI test to principal.
+    Funding leg accrues per swap period, path-dependent (stops once redeemed).
+
+    Returns: events (list[list[(payment_date, net_amount_to_Barclays)]]),
+             ko_period_idx (array, -1 if never KO'd, else period index)
+    """
+    shares      = spec["shares"]
+    Notional    = shares * S0
+    coupon_rate = spec["coupon_rate"]
+    KO_level    = spec["KO_barrier"] * S0
+    Cpn_level   = spec["coupon_barrier"] * S0
+    KI_level    = spec["KI_barrier"] * S0
+
+    ko_obs   = spec["ko_obs_dates"]
+    ko_pay   = spec["ko_pay_dates"]
+    cpn_obs  = spec["coupon_obs_dates"]
+    cpn_pay  = spec["coupon_pay_dates"]
+    sw_start = spec["swap_obs_start"]
+    sw_end   = spec["swap_obs_end"]
+    r_fund   = COMMON["r_rate_funding"]
+
+    n_ko_periods = len(ko_obs)      # periods 0..n_ko_periods-1 have a KO test
+    n_periods    = len(cpn_obs)     # total periods, last one is maturity (no KO test)
+    N = S_df.shape[0]
+
+    tau = [(sw_end[k] - sw_start[k]).days / 360 for k in range(n_periods)]
+
+    events = [[] for _ in range(N)]
+    ko_period_idx = np.full(N, -1, dtype=int)
+
+    for i in range(N):
+        resolved = False
+        for k in range(n_ko_periods):
+            S_k = S_df[ko_obs[k]].values[i]
+            funding_k = Notional * r_fund * tau[k]
+            coupon_k  = Notional * coupon_rate if S_k >= Cpn_level else 0.0
+
+            if S_k >= KO_level:
+                events[i].append((ko_pay[k], funding_k - (coupon_k + Notional)))
+                ko_period_idx[i] = k
+                resolved = True
+                break
+            else:
+                events[i].append((cpn_pay[k], funding_k - coupon_k))
+
+        if not resolved:
+            # Final period: KI test (European, only here) + last coupon test
+            k = n_periods - 1
+            S_final   = S_df[cpn_obs[k]].values[i]
+            funding_k = Notional * r_fund * tau[k]
+            ki_trig   = S_final < KI_level
+            if ki_trig:
+                coupon_k, principal_k = 0.0, Notional * (S_final / S0)
+            else:
+                coupon_k  = Notional * coupon_rate if S_final >= Cpn_level else 0.0
+                principal_k = Notional
+            events[i].append((cpn_pay[k], funding_k - (coupon_k + principal_k)))
+
+    return events, ko_period_idx, Notional
+
+#%% ---------------------------------------------------------------------
+# 3. Regression valuation V_hat(t) -- generalized to N periods
+# -------------------------------------------------------------------------
+
+def year_frac(d1, d2):
+    return (d2 - d1).days / 365.0
+
+def pv_at(amount, valuation_date, payment_date, r):
+    return amount * np.exp(-r * year_frac(valuation_date, payment_date))
+
+def make_basis_matrix(S0, KO_level_frac, KI_level_frac):
+    def basis_matrix(Sv):
+        m = Sv / S0
+        return np.column_stack([np.ones_like(m), m, m**2,
+                                 np.maximum(m - KO_level_frac, 0),
+                                 np.maximum(KI_level_frac - m, 0)])
+    return basis_matrix
+
+def build_V_hat_func(spec, S_df, S0, events, ko_period_idx, r_rate):
+    ko_obs  = spec["ko_obs_dates"]
+    ko_pay  = spec["ko_pay_dates"]
+    cpn_pay = spec["coupon_pay_dates"]
+    n_ko_periods = len(ko_obs)
+    N = S_df.shape[0]
+    basis_matrix = make_basis_matrix(S0, spec["KO_barrier"], spec["KI_barrier"])
+
+    # Pre-flatten: for each path, its own realized (payment_date, amount) list
+    # already stored in `events[i]`.
+
+    def value_of_remaining(i, t):
+        """Sum of pv_at(amount, t, pay_date) over events with pay_date > t."""
+        total = 0.0
+        for pay_date, amount in events[i]:
+            if pay_date > t:
+                total += pv_at(amount, t, pay_date, r_rate)
+        return total
+
+    def resolved_before(t):
+        """Boolean mask: path's fate is already determined as of t
+        (KO triggered at a period whose obs date <= t)."""
+        mask = np.zeros(N, dtype=bool)
+        for k in range(n_ko_periods):
+            trig_and_known = (ko_period_idx == k) & (ko_obs[k] <= t)
+            mask |= trig_and_known
+        return mask
+
+    def compute_V_hat(t):
+        V = np.zeros(N)
+        known = resolved_before(t)
+        S_t = S_df[t].values
+
+        # Deterministic part: paths whose fate is already known as of t
+        for i in np.where(known)[0]:
+            V[i] = value_of_remaining(i, t)
+
+        # Unresolved part: regress realized remaining PV on moneyness at t
+        unresolved_idx = np.where(~known)[0]
+        if len(unresolved_idx) > 0:
+            Y = np.array([value_of_remaining(i, t) for i in unresolved_idx])
+            X = basis_matrix(S_t[unresolved_idx])
+            beta, *_ = np.linalg.lstsq(X, Y, rcond=None)
+            V[unresolved_idx] = X @ beta
+
+        return V
+
+    return compute_V_hat
+
+#%% ---------------------------------------------------------------------
+# 4. Full pipeline for one trade
+# -------------------------------------------------------------------------
+
+def run_trade(spec, out_prefix=None, n_paths=N_PATHS, mpor_days=MPOR_DAYS, pctl=PFE_PCTL):
+    ticker = spec["ticker"]
+    out_prefix = out_prefix or ticker
+
+    df = pd.read_excel(spec["price_file"], sheet_name="Sheet1")
+    df = df[~df["Open"].astype(str).str.contains("Dividend", case=False, na=False)]
+    df.columns = df.columns.str.strip()
+    df = df[["Date", "Adj Close"]].set_index("Date")
+    prices = df.sort_index().iloc[:, 0]
+    returns = np.log(prices).diff().dropna().values
+    S0 = prices.iloc[-1]
+
+    omega, alpha, beta, h_last, r_last, z = calibrate_garch(returns)
+    print(f"[{ticker}] GARCH: omega={omega:.3e} alpha={alpha:.4f} beta={beta:.4f} "
+          f"(persistence={alpha+beta:.4f})  S0={S0:.2f}")
+
+    start_date = spec["pricing_date"]
+    end_date   = spec["coupon_obs_dates"][-1]     # final observation date = maturity obs
+
+    S_df = simulate_paths(S0, start_date, end_date, omega, alpha, beta, h_last, r_last, z,
+                           COMMON["r_rate"], n_paths=n_paths)
+    available_dates = S_df.columns
+
+    events, ko_period_idx, Notional = realized_cashflows(spec, S_df, S0)
+    ko_ratio = (ko_period_idx >= 0).mean()
+    print(f"[{ticker}] KO ratio (any period): {ko_ratio:.2%}   Notional=${Notional:,.0f}")
+
+    compute_V_hat = build_V_hat_func(spec, S_df, S0, events, ko_period_idx, COMMON["r_rate"])
+
+    def snap(dte):
+        if dte in available_dates:
+            return dte
+        idx = available_dates.get_indexer([dte], method="nearest")[0]
+        return available_dates[idx]
+
+    weekly_grid = pd.date_range(start=start_date, end=end_date, freq="7D")
+    forced = set(spec["ko_obs_dates"]) | {spec["coupon_obs_dates"][-1]}
+    grid_dates = sorted(set(snap(dte) for dte in weekly_grid) | forced)
+
+    pfe_rows = []
+    for t in grid_dates:
+        E_t = np.maximum(compute_V_hat(t), 0)
+        pfe_rows.append({"date": t, f"PFE_{pctl}": np.percentile(E_t, pctl), "EE": E_t.mean()})
+    pfe_df = pd.DataFrame(pfe_rows).set_index("date")
+
+    def shift_bd(t, n):
+        idx = available_dates.get_loc(t)
+        return available_dates[max(idx - n, 0)]
+
+    mpor_rows = []
+    for t in grid_dates:
+        t_minus = shift_bd(t, mpor_days)
+        if t_minus == t:
+            continue
+        E_t = np.maximum(compute_V_hat(t), 0)
+        E_tm = np.maximum(compute_V_hat(t_minus), 0)
+        E_mpor = np.maximum(E_t - E_tm, 0)
+        mpor_rows.append({"date": t, "t_minus": t_minus, f"PFE_MPOR_{pctl}": np.percentile(E_mpor, pctl)})
+    pfe_mpor_df = pd.DataFrame(mpor_rows).set_index("date")
+
+    pfe_df.to_csv(f"{out_prefix}_pfe.csv")
+    pfe_mpor_df.to_csv(f"{out_prefix}_pfe_mpor.csv")
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+    ax.plot(pfe_df.index, pfe_df[f"PFE_{pctl}"], color="#B22222", linewidth=2,
+            label=f"PFE {pctl}% (no MPOR)")
+    ax.plot(pfe_mpor_df.index, pfe_mpor_df[f"PFE_MPOR_{pctl}"], color="#1f77b4", linewidth=2,
+            label=f"PFE {pctl}% ({mpor_days}bd MPOR)")
+    ax.plot(pfe_df.index, pfe_df["EE"], color="gray", linewidth=1.2, linestyle="--", label="EE")
+    for dte in spec["ko_obs_dates"]:
+        ax.axvline(dte, color="gray", linestyle=":", linewidth=0.8)
+    ax.axvline(spec["coupon_obs_dates"][-1], color="black", linestyle=":", linewidth=1)
+    ax.set_title(f"{ticker} Autocallable — CCR Exposure Profile (Barclays as Seller)")
+    ax.set_ylabel("USD")
+    ax.legend()
+    ax.grid(alpha=0.3)
+    ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"${x/1e6:.1f}M"))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
+    fig.autofmt_xdate()
+    plt.tight_layout()
+    plt.savefig(f"{out_prefix}_pfe_chart.png", dpi=150)
+    plt.close(fig)
+
+    return pfe_df, pfe_mpor_df
+
+#%% ---------------------------------------------------------------------
+# 5. Run all trades
+# -------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    for name, spec in TRADES.items():
+        try:
+            run_trade(spec)
+        except FileNotFoundError:
+            print(f"[{name}] SKIPPED — price file '{spec['price_file']}' not found.")
