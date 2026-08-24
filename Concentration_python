@@ -1,0 +1,227 @@
+"""
+SPX Concentration Heat Map Builder
+-----------------------------------
+Reads the long-format CSV output from the Gross / Net SQL queries
+(columns: RowISIN, RowLabel, ColAccountId, ColLabel, CellValue,
+RowSortValue, ColSortValue) and produces sorted, heat-mapped matrices.
+
+Usage:
+    python concentration_heatmap.py
+
+Edit the CONFIG section below to point at your actual CSV file paths.
+"""
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# ============================================================
+# CONFIG — edit these
+# ============================================================
+GROSS_CSV_PATH = "gross_concentration.csv"   # path to Gross query output
+NET_CSV_PATH   = "net_concentration.csv"     # path to Net query output
+
+TOP_N_CLIENTS = 40      # how many client columns to show individually
+                         # (beyond this, remaining clients are folded into "Others")
+TOP_N_ISINS   = None    # None = show all ISIN rows; set an int to cap rows too
+
+OUTPUT_GROSS_PNG = "heatmap_gross.png"
+OUTPUT_NET_PNG   = "heatmap_net.png"
+OUTPUT_COMBINED_PNG = "heatmap_combined.png"
+
+FIG_WIDTH_PER_COL  = 0.35   # inches per column, scales figure width to matrix size
+FIG_HEIGHT_PER_ROW = 0.30   # inches per row
+
+
+# ============================================================
+# Core loading / pivoting logic
+# ============================================================
+def load_long_table(csv_path: str) -> pd.DataFrame:
+    """Load the SQL query output and do basic type/consistency checks."""
+    df = pd.read_csv(csv_path, dtype={"RowISIN": str, "ColAccountId": str})
+
+    required_cols = {
+        "RowISIN", "RowLabel", "ColAccountId", "ColLabel",
+        "CellValue", "RowSortValue", "ColSortValue",
+    }
+    missing = required_cols - set(df.columns)
+    if missing:
+        raise ValueError(f"CSV is missing expected columns: {missing}")
+
+    # Sanity check: the TOTAL anchor row/col should exist
+    if not (df["RowISIN"] == "TOTAL").any():
+        print(f"[WARN] {csv_path}: no 'TOTAL' anchor row found — "
+              f"check BusinessDate matched data in the SQL query.")
+    if not (df["ColAccountId"] == "TOTAL").any():
+        print(f"[WARN] {csv_path}: no 'TOTAL' anchor column found.")
+
+    return df
+
+
+def build_sorted_matrix(df: pd.DataFrame, top_n_clients=None, top_n_isins=None):
+    """
+    Pivot the long table into a matrix, sorted so the largest values
+    are top-left, smallest bottom-right. Keeps the TOTAL row/col pinned
+    at the very top/left regardless of sort value.
+    """
+    # --- unique row keys, sorted by RowSortValue desc, TOTAL pinned first ---
+    row_meta = (
+        df[["RowISIN", "RowLabel", "RowSortValue"]]
+        .drop_duplicates()
+        .sort_values("RowSortValue", ascending=False)
+    )
+    row_meta["is_total"] = row_meta["RowISIN"] == "TOTAL"
+    row_meta = pd.concat([
+        row_meta[row_meta["is_total"]],
+        row_meta[~row_meta["is_total"]],
+    ])
+    if top_n_isins is not None:
+        total_row = row_meta[row_meta["is_total"]]
+        rest = row_meta[~row_meta["is_total"]].head(top_n_isins)
+        row_meta = pd.concat([total_row, rest])
+
+    # --- unique col keys, sorted by ColSortValue desc, TOTAL pinned first ---
+    col_meta = (
+        df[["ColAccountId", "ColLabel", "ColSortValue"]]
+        .drop_duplicates()
+        .sort_values("ColSortValue", ascending=False)
+    )
+    col_meta["is_total"] = col_meta["ColAccountId"] == "TOTAL"
+    col_meta = pd.concat([
+        col_meta[col_meta["is_total"]],
+        col_meta[~col_meta["is_total"]],
+    ])
+
+    others_label = None
+    if top_n_clients is not None:
+        total_col = col_meta[col_meta["is_total"]]
+        kept = col_meta[~col_meta["is_total"]].head(top_n_clients)
+        dropped = col_meta[~col_meta["is_total"]].iloc[top_n_clients:]
+        col_meta = pd.concat([total_col, kept])
+        if len(dropped) > 0:
+            others_label = f"Others ({len(dropped)} clients)"
+
+    # --- pivot to matrix using ISIN / AccountId as keys, then relabel ---
+    pivot = df.pivot_table(
+        index="RowISIN", columns="ColAccountId", values="CellValue", aggfunc="first"
+    )
+
+    # reindex to the full sorted set of rows/cols, filling missing combos with 0
+    row_order = row_meta["RowISIN"].tolist()
+    col_order = col_meta["ColAccountId"].tolist()
+    pivot = pivot.reindex(index=row_order, columns=col_order, fill_value=0.0)
+
+    # if truncating clients, fold the dropped columns' values into an "Others" column
+    if top_n_clients is not None and others_label is not None:
+        dropped_ids = dropped["ColAccountId"].tolist()
+        dropped_vals = df[df["ColAccountId"].isin(dropped_ids)]
+        # Others column = sum of CellValue across dropped clients, per row
+        # (only meaningful for Gross-style non-negative measures; for Net,
+        # summing signed values is still valid — it shows net tilt of the "long tail")
+        others_col = (
+            dropped_vals.groupby("RowISIN")["CellValue"].sum()
+            .reindex(row_order, fill_value=0.0)
+        )
+        pivot[others_label] = others_col
+        col_order = col_order + [others_label]
+        pivot = pivot[col_order]
+
+    # build human-readable labels for axes
+    row_label_map = dict(zip(row_meta["RowISIN"], row_meta["RowLabel"]))
+    col_label_map = dict(zip(col_meta["ColAccountId"], col_meta["ColLabel"]))
+    if others_label is not None:
+        col_label_map[others_label] = others_label
+
+    pivot.index = [row_label_map.get(i, i) for i in pivot.index]
+    pivot.columns = [col_label_map.get(c, c) for c in pivot.columns]
+
+    return pivot
+
+
+# ============================================================
+# Plotting
+# ============================================================
+def plot_heatmap(matrix: pd.DataFrame, title: str, output_path: str,
+                  diverging: bool = False):
+    n_rows, n_cols = matrix.shape
+    fig_w = max(10, n_cols * FIG_WIDTH_PER_COL)
+    fig_h = max(8, n_rows * FIG_HEIGHT_PER_ROW)
+
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+
+    if diverging:
+        vmax = np.nanmax(np.abs(matrix.values)) if matrix.size else 1.0
+        cmap = "RdBu_r"   # red = net short tilt, blue = net long tilt (flip if you prefer)
+        vmin, vcenter, vmax_ = -vmax, 0, vmax
+        sns.heatmap(
+            matrix, ax=ax, cmap=cmap, center=0, vmin=vmin, vmax=vmax_,
+            cbar_kws={"label": "Net exposure / client total"},
+            linewidths=0.3, linecolor="white",
+        )
+    else:
+        sns.heatmap(
+            matrix, ax=ax, cmap="OrRd", vmin=0,
+            cbar_kws={"label": "Gross exposure / total"},
+            linewidths=0.3, linecolor="white",
+        )
+
+    ax.set_title(title, fontsize=13, weight="bold")
+    ax.set_xlabel("Counterparty (ClientName + AccountId)")
+    ax.set_ylabel("ISIN — Equity Name")
+    plt.setp(ax.get_xticklabels(), rotation=90, fontsize=7)
+    plt.setp(ax.get_yticklabels(), rotation=0, fontsize=7)
+
+    plt.tight_layout()
+    fig.savefig(output_path, dpi=200)
+    plt.close(fig)
+    print(f"Saved: {output_path}  (matrix shape: {matrix.shape})")
+
+
+# ============================================================
+# Main
+# ============================================================
+def main():
+    gross_df = load_long_table(GROSS_CSV_PATH)
+    net_df = load_long_table(NET_CSV_PATH)
+
+    gross_matrix = build_sorted_matrix(gross_df, TOP_N_CLIENTS, TOP_N_ISINS)
+    net_matrix = build_sorted_matrix(net_df, TOP_N_CLIENTS, TOP_N_ISINS)
+
+    plot_heatmap(
+        gross_matrix,
+        title="SPX 500 Concentration — Gross Exposure (share of client's total book)",
+        output_path=OUTPUT_GROSS_PNG,
+        diverging=False,
+    )
+    plot_heatmap(
+        net_matrix,
+        title="SPX 500 Concentration — Net Exposure (signed, share of client's total book)",
+        output_path=OUTPUT_NET_PNG,
+        diverging=True,
+    )
+
+    # Optional: side-by-side combined figure
+    fig, axes = plt.subplots(
+        1, 2,
+        figsize=(max(20, gross_matrix.shape[1] * FIG_WIDTH_PER_COL * 2),
+                  max(8, gross_matrix.shape[0] * FIG_HEIGHT_PER_ROW)),
+    )
+    sns.heatmap(gross_matrix, ax=axes[0], cmap="OrRd", vmin=0,
+                cbar_kws={"label": "Gross"}, linewidths=0.3, linecolor="white")
+    axes[0].set_title("Gross")
+    vmax = np.nanmax(np.abs(net_matrix.values)) if net_matrix.size else 1.0
+    sns.heatmap(net_matrix, ax=axes[1], cmap="RdBu_r", center=0, vmin=-vmax, vmax=vmax,
+                cbar_kws={"label": "Net"}, linewidths=0.3, linecolor="white")
+    axes[1].set_title("Net")
+    for ax in axes:
+        plt.setp(ax.get_xticklabels(), rotation=90, fontsize=6)
+        plt.setp(ax.get_yticklabels(), rotation=0, fontsize=6)
+    plt.tight_layout()
+    fig.savefig(OUTPUT_COMBINED_PNG, dpi=200)
+    plt.close(fig)
+    print(f"Saved: {OUTPUT_COMBINED_PNG}")
+
+
+if __name__ == "__main__":
+    main()
