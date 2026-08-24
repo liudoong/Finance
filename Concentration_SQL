@@ -1,0 +1,88 @@
+DECLARE @BusinessDate DATE = '2026-08-18';
+
+WITH SPX_ISIN AS (
+    SELECT 'US88579Y1010' AS ISIN
+    UNION ALL SELECT 'US0378331005'
+    UNION ALL SELECT 'US0028241000'
+    UNION ALL SELECT 'US00287Y1091'
+    -- ... 你把全部500个ISIN写在这里,一路UNION ALL下去
+),
+
+account_isin_net AS (
+    SELECT 
+        t.AccountId, t.ClientName, t.ISIN,
+        MAX(t.ProductDescription) AS ProductDescription,
+        SUM(t.TDMarketValueUSD)   AS net_value_isin
+    FROM PBTradeLevelMargin t
+    WHERE t.BusinessDate = @BusinessDate
+    GROUP BY t.AccountId, t.ClientName, t.ISIN
+),
+
+client_total_gross AS (
+    SELECT AccountId, ClientName, SUM(ABS(net_value_isin)) AS client_total
+    FROM account_isin_net GROUP BY AccountId, ClientName
+),
+
+client_spx_gross AS (
+    SELECT a.AccountId, a.ClientName, SUM(ABS(a.net_value_isin)) AS client_spx
+    FROM account_isin_net a
+    INNER JOIN SPX_ISIN s ON a.ISIN = s.ISIN
+    GROUP BY a.AccountId, a.ClientName
+),
+
+isin_total_gross AS (
+    SELECT a.ISIN, MAX(a.ProductDescription) AS ProductDescription,
+           SUM(ABS(a.net_value_isin)) AS isin_total
+    FROM account_isin_net a
+    INNER JOIN SPX_ISIN s ON a.ISIN = s.ISIN
+    GROUP BY a.ISIN
+),
+
+book_total_gross AS (
+    SELECT SUM(client_total) AS book_total FROM client_total_gross
+),
+
+book_spx_total_gross AS (
+    SELECT SUM(client_spx) AS book_spx_total FROM client_spx_gross
+)
+
+SELECT 'TOTAL' AS RowISIN, 'All SPX 500' AS RowLabel,
+       'TOTAL' AS ColAccountId, 'Firm Total' AS ColLabel,
+       bs.book_spx_total / NULLIF(bt.book_total,0) AS CellValue,
+       bs.book_spx_total / NULLIF(bt.book_total,0) AS RowSortValue,
+       bs.book_spx_total / NULLIF(bt.book_total,0) AS ColSortValue
+FROM book_spx_total_gross bs CROSS JOIN book_total_gross bt
+
+UNION ALL
+SELECT 'TOTAL', 'All SPX 500',
+       CAST(c.AccountId AS VARCHAR(50)), c.ClientName + ' (' + CAST(c.AccountId AS VARCHAR(50)) + ')',
+       c.client_spx / NULLIF(t.client_total,0),
+       bs.book_spx_total / NULLIF(bt.book_total,0),
+       c.client_spx / NULLIF(t.client_total,0)
+FROM client_spx_gross c
+JOIN client_total_gross t ON t.AccountId=c.AccountId AND t.ClientName=c.ClientName
+CROSS JOIN book_spx_total_gross bs CROSS JOIN book_total_gross bt
+
+UNION ALL
+SELECT i.ISIN, i.ISIN + ' - ' + i.ProductDescription,
+       'TOTAL', 'Firm Total',
+       i.isin_total / NULLIF(bt.book_total,0),
+       i.isin_total / NULLIF(bt.book_total,0),
+       bs.book_spx_total / NULLIF(bt.book_total,0)
+FROM isin_total_gross i
+CROSS JOIN book_total_gross bt CROSS JOIN book_spx_total_gross bs
+
+UNION ALL
+SELECT a.ISIN, a.ISIN + ' - ' + a.ProductDescription,
+       CAST(a.AccountId AS VARCHAR(50)), a.ClientName + ' (' + CAST(a.AccountId AS VARCHAR(50)) + ')',
+       ABS(a.net_value_isin) / NULLIF(t.client_total,0),
+       i.isin_total / NULLIF(bt.book_total,0),
+       c.client_spx / NULLIF(t.client_total,0)
+FROM account_isin_net a
+INNER JOIN SPX_ISIN sp ON a.ISIN = sp.ISIN
+JOIN client_total_gross t ON t.AccountId=a.AccountId AND t.ClientName=a.ClientName
+JOIN client_spx_gross c ON c.AccountId=a.AccountId AND c.ClientName=a.ClientName
+JOIN isin_total_gross i ON i.ISIN = a.ISIN
+CROSS JOIN book_total_gross bt
+
+ORDER BY RowSortValue DESC, ColSortValue DESC;
