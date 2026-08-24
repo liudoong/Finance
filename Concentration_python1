@@ -1,0 +1,42 @@
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# 1. 读取Gross口径的CSV结果
+df = pd.read_csv("gross_concentration.csv", dtype={"RowISIN": str, "ColAccountId": str})
+
+# 2. 按RowSortValue / ColSortValue取出行、列的排序顺序(降序,数值大的在前)
+row_order = (
+    df[["RowISIN", "RowSortValue"]]
+    .drop_duplicates()
+    .sort_values("RowSortValue", ascending=False)["RowISIN"]
+)
+col_order = (
+    df[["ColAccountId", "ColSortValue"]]
+    .drop_duplicates()
+    .sort_values("ColSortValue", ascending=False)["ColAccountId"]
+)
+
+# 3. 取出行/列标签(ISIN+股票名, ClientName+AccountId)方便画图时显示
+row_labels = df.drop_duplicates("RowISIN").set_index("RowISIN")["RowLabel"]
+col_labels = df.drop_duplicates("ColAccountId").set_index("ColAccountId")["ColLabel"]
+
+# 4. 转成矩阵,缺失组合(没有持仓)填0
+matrix = df.pivot_table(index="RowISIN", columns="ColAccountId", values="CellValue", aggfunc="first")
+matrix = matrix.reindex(index=row_order, columns=col_order, fill_value=0.0)
+
+# 5. 把行列名换成可读标签
+matrix.index = matrix.index.map(row_labels)
+matrix.columns = matrix.columns.map(col_labels)
+
+# 6. 画热力图
+plt.figure(figsize=(14, 10))
+sns.heatmap(matrix, cmap="OrRd", vmin=0, linewidths=0.2, linecolor="white")
+plt.title("SPX 500 Concentration — Gross Exposure")
+plt.xlabel("Counterparty")
+plt.ylabel("ISIN — Equity")
+plt.xticks(rotation=90, fontsize=6)
+plt.yticks(rotation=0, fontsize=6)
+plt.tight_layout()
+plt.savefig("heatmap_gross_simple.png", dpi=200)
+plt.show()
