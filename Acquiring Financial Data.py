@@ -81,14 +81,19 @@ data = web.DataReader(symbol, "fred", start_date, end_date)
 
 
 
+Reading B: PFE × PD^¼
+This stays linear in PFE, so the result is still dollars. It’s a PD-weighted exposure that you can sum and compare.
+It is concave in PD, so riskier names get more weight, but much less than proportionally:
+PD	PD^¼	Weighted PFE on $100m
+0.1%	0.178	$17.8m
+1%	0.316	$31.6m
+10%	0.562	$56.2m
 
-Repo a TBA: no. A repo needs a security you own and can deliver as collateral. A TBA is only a promise to deliver pools on a future settlement date, so before that date there is nothing to pledge. The substitute is the dollar roll (sell the front month, buy back the next month), which gives you the same financing economics. If you want an actual repo, you take delivery of the pools and repo those.
+Under this reading, a 100× increase in PD only raises the weight about 3×.
 
-Cash-trade a TBA: yes, in one sense and no in another.
+Why this could make sense: it resembles how regulatory capital scales. Under the Basel IRB formula, the capital charge per dollar of EAD rises with PD, but much more slowly than linearly. Plain PD × PFE (expected-loss style) treats a 10% PD name as 100× riskier than a 0.1% PD name, which overstates things from a capital or stress perspective. A fractional power of PD is a crude stand-in for that concave curve. A fourth root is flatter than IRB is over most of the PD range; IRB behaves more like a power somewhere between ¼ and ½. So I’d see Reading B as a simple capital-like proxy, not a recognised model.
 
-Yes, outright buying and selling. TBAs are the main outright trading market for agency MBS. Street desks quote them, and people trade them directly for exposure, hedging, or relative value. Market participants call this the “cash MBS” market to distinguish it from derivatives like swaps or futures. In that sense TBA trading is cash trading.
-No, spot settlement. You can’t settle a TBA T+1 or T+2 like a Treasury. TBAs settle only on the monthly SIFMA settlement dates, one for each product class (Fannie/Freddie 30-year, 15-year, Ginnie, and so on). Pool details are announced 48 hours before settlement. The closest you can get to spot is trading the front month just before its settlement date.
-
-If you want true spot settlement, trade specified pools. A specified pool is an identified pool with a known CUSIP, loan characteristics, and prepayment profile. It trades outright with normal short settlement, usually at a payup over TBA for better prepayment characteristics. It is also what you would put into repo.
-
-
+What I’d confirm with Jack
+Which bracket? Reading B is the only one I’d defend, because it keeps the result in dollars.
+What is it for? Ranking counterparties, picking names for stress scenarios, or allocating limits? Choosing the PD exponent only makes sense once the purpose is clear.
+Where does “one-year” fit? Neither reading turns a PFE into a one-year PFE. More likely the PD is a one-year PD and the PFE is a one-year-horizon peak, so the product is a one-year weighted exposure. Make sure both inputs actually use the same horizon.
