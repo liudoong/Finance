@@ -79,3 +79,16 @@ symbol = "GS10"
 data = web.DataReader(symbol, "fred", start_date, end_date)
 
 
+
+
+
+Repo a TBA: no. A repo needs a security you own and can deliver as collateral. A TBA is only a promise to deliver pools on a future settlement date, so before that date there is nothing to pledge. The substitute is the dollar roll (sell the front month, buy back the next month), which gives you the same financing economics. If you want an actual repo, you take delivery of the pools and repo those.
+
+Cash-trade a TBA: yes, in one sense and no in another.
+
+Yes, outright buying and selling. TBAs are the main outright trading market for agency MBS. Street desks quote them, and people trade them directly for exposure, hedging, or relative value. Market participants call this the “cash MBS” market to distinguish it from derivatives like swaps or futures. In that sense TBA trading is cash trading.
+No, spot settlement. You can’t settle a TBA T+1 or T+2 like a Treasury. TBAs settle only on the monthly SIFMA settlement dates, one for each product class (Fannie/Freddie 30-year, 15-year, Ginnie, and so on). Pool details are announced 48 hours before settlement. The closest you can get to spot is trading the front month just before its settlement date.
+
+If you want true spot settlement, trade specified pools. A specified pool is an identified pool with a known CUSIP, loan characteristics, and prepayment profile. It trades outright with normal short settlement, usually at a payup over TBA for better prepayment characteristics. It is also what you would put into repo.
+
+
