@@ -82,3 +82,147 @@ def rolling_vol(df, weeks, col=None, annualize=True, trading_days=252,
 # vol_up   = rolling_vol(series1, 4, filter_type="up",       coeff=0.9)
 # vol_down = rolling_vol(series1, 4, filter_type="down",     coeff=1.1)
 # vol_cor  = rolling_vol(series1, 4, filter_type="corridor", coeff=(0.9, 1.1))
+
+
+
+
+
+
+
+
+
+import numpy as np
+import pandas as pd
+from pandas.api.indexers import FixedForwardWindowIndexer
+
+
+def _pick_series(x, col):
+    # take out a float Series from a DataFrame or Series
+    s = x if isinstance(x, pd.Series) else (x[col] if col is not None else x.iloc[:, 0])
+    return s.astype(float)
+
+
+def rolling_vol(df, weeks, col=None, annualize=True, trading_days=252,
+                filter_type=None, coeff=None, obs=None, obs_col=None,
+                vol_cap=None, zero_mean=True):
+    '''
+    Rolling realized vol with optional up / down / corridor (incl. cross corridor)
+    filtering and an optional vol cap.
+
+    df          : main DataFrame or Series (returns / vol are computed on it),
+                  newest observation on the first row
+    weeks       : window length in weeks (n = 5 * weeks trading days)
+    col         : column of df to use (default: first column)
+    filter_type : None | "up" | "down" | "corridor"
+    coeff       : "up"       -> float < 1,  B = coeff * S0, keep O_{t-1} > B
+                  "down"     -> float > 1,  B = coeff * S0, keep O_{t-1} < B
+                  "corridor" -> (low, high), low < 1 < high,
+                                keep low*S0 < O_{t-1} < high*S0
+                  O = observation series, S0 = O on the latest date of the main series.
+                  Boundary values are filtered out. Filtered returns -> 0.
+    obs         : observation DataFrame or Series for filtering (cross corridor).
+                  None -> use the main series itself. Passing the same data as df
+                  gives the same result as None.
+                  obs is aligned to the main series dates and forward-filled;
+                  returns whose O_{t-1} is still missing are set to NaN.
+    obs_col     : column of obs to use (default: first column)
+    vol_cap     : None or float > 0, same units as the output vol
+                  (annualized if annualize=True). Final vol = min(vol, vol_cap).
+                  Applied after any return filtering.
+    zero_mean   : True  -> sqrt(mean(r^2)), variance-swap convention
+                  False -> std(ddof=1), original behaviour
+    Returns     : vol Series
+    '''
+
+    # set step number and take out dataframe column
+    n = 5 * int(weeks)
+    s = _pick_series(df, col)
+
+    # make sure newest observation is on the first row
+    if isinstance(s.index, pd.DatetimeIndex) and not s.index.is_monotonic_decreasing:
+        s = s.sort_index(ascending=False)
+
+    # previous day price S_{t-1}; log return r_t = ln(S_t / S_{t-1})
+    s_prev = s.shift(-1)
+    r = np.log(s / s_prev)
+
+    # ---------------- return filtering ----------------
+    if filter_type is not None:
+
+        # observation series aligned to main series dates
+        if obs is None:
+            o = s
+        else:
+            if not isinstance(s.index, pd.DatetimeIndex):
+                raise ValueError("main series needs a DatetimeIndex when obs is given")
+            o_raw = _pick_series(obs, obs_col)
+            if not isinstance(o_raw.index, pd.DatetimeIndex):
+                raise ValueError("obs needs a DatetimeIndex")
+            o_raw = o_raw[~o_raw.index.duplicated(keep="first")].sort_index()
+            # forward fill in calendar order: only use obs values known at that date
+            o = (o_raw.reindex(o_raw.index.union(s.index))
+                      .sort_index()
+                      .ffill()
+                      .reindex(s.index))
+
+        # O_{t-1}: observation on the start date of each return
+        o_prev = o.shift(-1)
+        S0 = o.iloc[0]
+        if pd.isna(S0):
+            raise ValueError("obs has no value on or before the latest date of the main series")
+
+        if filter_type == "up":
+            if coeff is None or not (0 < coeff < 1):
+                raise ValueError("up: coeff must be a float in (0, 1)")
+            mask = o_prev > coeff * S0
+
+        elif filter_type == "down":
+            if coeff is None or not (coeff > 1):
+                raise ValueError("down: coeff must be a float > 1")
+            mask = o_prev < coeff * S0
+
+        elif filter_type == "corridor":
+            if coeff is None or len(coeff) != 2:
+                raise ValueError("corridor: coeff must be a tuple (low, high)")
+            low, high = coeff
+            if not (0 < low < 1 < high):
+                raise ValueError("corridor: need 0 < low < 1 < high")
+            mask = (o_prev > low * S0) & (o_prev < high * S0)
+
+        else:
+            raise ValueError('filter_type must be None, "up", "down" or "corridor"')
+
+        # filtered returns -> 0; missing return or missing observation -> NaN
+        r = r.where(mask, 0.0)
+        r[s_prev.isna() | o_prev.isna()] = np.nan
+
+    # ---------------- rolling vol ----------------
+    # window covers row t and then n-1 rows below it
+    idx = FixedForwardWindowIndexer(window_size=n)
+
+    if zero_mean:
+        var = (r ** 2).rolling(window=idx, min_periods=n).mean()
+        vol = np.sqrt(var)
+    else:
+        vol = r.rolling(window=idx, min_periods=n).std(ddof=1)
+
+    if annualize:
+        vol = vol * np.sqrt(trading_days)
+
+    # ---------------- vol cap ----------------
+    if vol_cap is not None:
+        if not vol_cap > 0:
+            raise ValueError("vol_cap must be > 0")
+        vol = vol.clip(upper=vol_cap)
+
+    return vol
+
+
+# examples
+# vol_all   = rolling_vol(series1, 4)
+# vol_up    = rolling_vol(series1, 4, filter_type="up",       coeff=0.9)
+# vol_cor   = rolling_vol(series1, 4, filter_type="corridor", coeff=(0.9, 1.1))
+# vol_cross = rolling_vol(series1, 4, filter_type="corridor", coeff=(0.9, 1.1), obs=series2)  # SPX vol, NDX corridor
+# vol_same  = rolling_vol(series1, 4, filter_type="corridor", coeff=(0.9, 1.1), obs=series1)  # == vol_cor
+# vol_capd  = rolling_vol(series1, 4, vol_cap=0.30)                                           # capped unconditional
+# vol_both  = rolling_vol(series1, 4, filter_type="down", coeff=1.1, obs=series2, vol_cap=0.30)
