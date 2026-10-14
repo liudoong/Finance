@@ -1,0 +1,84 @@
+import numpy as np
+import pandas as pd
+from pandas.api.indexers import FixedForwardWindowIndexer
+
+
+def rolling_vol(df, weeks, col=None, annualize=True, trading_days=252,
+                filter_type=None, coeff=None, zero_mean=True):
+    '''
+    Rolling realized vol with optional up / down / corridor filtering.
+
+    df          : DataFrame or Series, newest observation on the first row
+    weeks       : window length in weeks (n = 5 * weeks trading days)
+    col         : column to use if df is a DataFrame (default: first column)
+    filter_type : None | "up" | "down" | "corridor"
+    coeff       : "up"       -> float < 1,  barrier B = coeff * S0, keep S_{t-1} > B
+                  "down"     -> float > 1,  barrier B = coeff * S0, keep S_{t-1} < B
+                  "corridor" -> (low, high), low < 1 < high,
+                                keep low*S0 < S_{t-1} < high*S0
+                  S0 = price on the latest date in df. Boundary prices are filtered out.
+    zero_mean   : True  -> sqrt(mean(r^2)), variance-swap convention
+                  False -> std(ddof=1), original behaviour
+    Returns     : vol Series (filtered returns set to 0, unconditional corridor variance)
+    '''
+
+    # set step number and take out dataframe column
+    n = 5 * int(weeks)
+    s = df if isinstance(df, pd.Series) else (df[col] if col is not None else df.iloc[:, 0])
+    s = s.astype(float)
+
+    # make sure newest observation is on the first row
+    if isinstance(s.index, pd.DatetimeIndex) and not s.index.is_monotonic_decreasing:
+        s = s.sort_index(ascending=False)
+
+    # previous day price S_{t-1}; log return r_t = ln(S_t / S_{t-1})
+    s_prev = s.shift(-1)
+    r = np.log(s / s_prev)
+
+    # filtering on S_{t-1}, relative to latest price S0
+    if filter_type is not None:
+        S0 = s.iloc[0]
+
+        if filter_type == "up":
+            if coeff is None or not (0 < coeff < 1):
+                raise ValueError("up: coeff must be a float in (0, 1)")
+            mask = s_prev > coeff * S0
+
+        elif filter_type == "down":
+            if coeff is None or not (coeff > 1):
+                raise ValueError("down: coeff must be a float > 1")
+            mask = s_prev < coeff * S0
+
+        elif filter_type == "corridor":
+            if coeff is None or len(coeff) != 2:
+                raise ValueError("corridor: coeff must be a tuple (low, high)")
+            low, high = coeff
+            if not (0 < low < 1 < high):
+                raise ValueError("corridor: need 0 < low < 1 < high")
+            mask = (s_prev > low * S0) & (s_prev < high * S0)
+
+        else:
+            raise ValueError('filter_type must be None, "up", "down" or "corridor"')
+
+        # filtered returns -> 0, keep original NaN (last row) as NaN
+        r = r.where(mask | r.isna(), 0.0)
+
+    # window covers row t and then n-1 rows below it
+    idx = FixedForwardWindowIndexer(window_size=n)
+
+    if zero_mean:
+        var = (r ** 2).rolling(window=idx, min_periods=n).mean()
+        vol = np.sqrt(var)
+    else:
+        vol = r.rolling(window=idx, min_periods=n).std(ddof=1)
+
+    if annualize:
+        vol = vol * np.sqrt(trading_days)
+    return vol
+
+
+# example
+# vol_all  = rolling_vol(series1, 4)
+# vol_up   = rolling_vol(series1, 4, filter_type="up",       coeff=0.9)
+# vol_down = rolling_vol(series1, 4, filter_type="down",     coeff=1.1)
+# vol_cor  = rolling_vol(series1, 4, filter_type="corridor", coeff=(0.9, 1.1))
